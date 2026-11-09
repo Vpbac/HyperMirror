@@ -1,0 +1,9 @@
+{
+  "name": "hypermirror-pc-receiver",
+  "version": "1.0.0",
+  "description": "HyperMirror Pro - Ultra-Low Latency Android Gaming Screen Mirror Receiver (USB & Wi-Fi)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

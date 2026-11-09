@@ -1,0 +1,15 @@
+# Android Gradle build & local SDK config
+android-sender/.gradle/
+android-sender/build/
+android-sender/app/build/
+android-sender/local.properties
+*.iml
+.idea/
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db

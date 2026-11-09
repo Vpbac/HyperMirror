@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HyperMirror Pro — PC Gaming Screen Mirror Receiver</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Left Sidebar: Connection & Low-Latency Controls -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-badge">ZERO-LATENCY ENGINE</div>
+        <h1>HYPERMIRROR <span>PRO</span></h1>
+        <p>Android ➔ PC Gaming Screen Mirroring (H.264 / H.265)</p>
+      </div>
+
+      <!-- Connection Section -->
+      <section class="card">
+        <h2>1. KẾT NỐI DÂY USB HOẶC WI-FI</h2>
+        <div class="info-row">
+          <span>IP Wi-Fi PC của bạn:</span>
+          <strong id="pcLanIp" class="highlight-cyan">Đang tải...</strong>
+        </div>
+        <div class="info-row">
+          <span>Cổng TCP (TCP_NODELAY):</span>
+          <strong id="streamPort">27183</strong>
+        </div>
+
+        <button id="btnUsbAdb" class="btn btn-primary">
+          ⚡ Kết nối Cáp USB (Auto ADB Forward/Reverse)
+        </button>
+
+        <div class="action-grid">
+          <button id="btnInstallApk" class="btn btn-secondary">📲 Cài APK qua USB</button>
+          <a href="/download-apk" class="btn btn-outline" style="text-decoration:none;">⬇ Tải file APK</a>
+        </div>
+
+        <div class="connect-manual">
+          <input id="inputPhoneIp" type="text" placeholder="Hoặc nhập IP Điện thoại (VD: 192.168.1.50)" value="127.0.0.1" />
+          <button id="btnConnectPhone" class="btn btn-secondary">Kết nối</button>
+        </div>
+        <div id="connectionToast" class="toast-msg">Sẵn sàng nhận kết nối từ App Android HyperMirror</div>
+      </section>
+
+      <!-- Live Gaming Optimization Section -->
+      <section class="card">
+        <h2>2. TỐI ƯU FPS &amp; BITRATE TRỰC TIẾP</h2>
+        <div class="slider-header">
+          <span>Bitrate Mục tiêu (Live CBR):</span>
+          <strong id="lblBitrateVal" class="highlight-green">16 Mbps</strong>
+        </div>
+        <input id="sliderBitrate" type="range" min="2" max="40" step="1" value="16" />
+        <div class="preset-row">
+          <button class="btn-chip" data-mbps="8">8 Mbps (Wi-Fi ổn định)</button>
+          <button class="btn-chip active" data-mbps="16">16 Mbps (Esports)</button>
+          <button class="btn-chip" data-mbps="32">32 Mbps (Cáp USB Ultra)</button>
+        </div>
+
+        <div class="action-grid">
+          <button id="btnForceIdr" class="btn btn-outline">🔄 Làm tươi Khung hình (IDR)</button>
+          <button id="btnFullscreen" class="btn btn-outline">⛶ Toàn màn hình</button>
+        </div>
+      </section>
+
+      <!-- Dual Render Mode & Built-in Simulator -->
+      <section class="card">
+        <h2>3. CHẾ ĐỘ HIỂN THỊ &amp; KIỂM THỬ</h2>
+        <button id="btnNativeFfplay" class="btn btn-accent">
+          🚀 Mở cửa sổ Native Direct3D (FFplay Zero-Buffer)
+        </button>
+        <button id="btnSimulator" class="btn btn-sim">
+          🎮 Chạy Luồng Giả Lập 60FPS H.264 (Test Ngay Trên PC)
+        </button>
+      </section>
+
+      <!-- Latency Architecture Checklist -->
+      <section class="card compact">
+        <h2>CÔNG NGHỆ GIẢM ĐỘ TRỄ ĐANG BẬT</h2>
+        <ul class="tech-list">
+          <li><span class="dot green"></span> <strong>Zero-Copy Surface:</strong> GPU ➔ MediaCodec trực tiếp</li>
+          <li><span class="dot green"></span> <strong>0 B-Frames &amp; KEY_LOW_LATENCY:</strong> Không giữ frame</li>
+          <li><span class="dot green"></span> <strong>TCP_NODELAY + DSCP QoS:</strong> Tắt gom gói Nagle</li>
+          <li><span class="dot green"></span> <strong>WebCodecs GPU + Desynchronized:</strong> Bỏ qua VSync</li>
+        </ul>
+      </section>
+    </aside>
+
+    <!-- Main Stage: Video Viewport & Live Telemetry HUD -->
+    <main class="main-stage">
+      <!-- Top Telemetry HUD Bar -->
+      <header class="hud-bar">
+        <div class="hud-pill status-pill" id="hudStatusPill">
+          <span class="status-dot" id="hudStatusDot"></span>
+          <span id="hudStatusText">CHƯA KẾT NỐI</span>
+        </div>
+
+        <div class="hud-metric">
+          <span class="label">THIẾT BỊ / CODEC</span>
+          <strong id="hudCodec">H.264 • 1920×1080</strong>
+        </div>
+
+        <div class="hud-metric">
+          <span class="label">FPS THỰC TẾ</span>
+          <strong id="hudFps" class="highlight-cyan">0 FPS</strong>
+        </div>
+
+        <div class="hud-metric">
+          <span class="label">BITRATE</span>
+          <strong id="hudBitrate" class="highlight-green">0.0 Mbps</strong>
+        </div>
+
+        <div class="hud-metric">
+          <span class="label">ĐỘ TRỄ DSP ENCODE</span>
+          <strong id="hudEncodeMs">0.00 ms</strong>
+        </div>
+
+        <div class="hud-metric">
+          <span class="label">ĐỘ TRỄ GIẢI MÃ GPU</span>
+          <strong id="hudDecodeMs">0.00 ms</strong>
+        </div>
+      </header>
+
+      <!-- Low-Latency Desynchronized Canvas Container -->
+      <div class="viewport-container" id="viewportContainer">
+        <canvas id="mirrorCanvas" width="1920" height="1080"></canvas>
+
+        <!-- Empty State Overlay -->
+        <div class="empty-overlay" id="emptyOverlay">
+          <div class="empty-box">
+            <div class="pulse-ring"></div>
+            <h3>Đang chờ luồng hình ảnh từ Android (:27183)</h3>
+            <p>
+              Cắm cáp USB và nhấn <strong>"⚡ Kết nối Cáp USB"</strong> ở thanh bên trái, hoặc nhập IP
+              PC vào ứng dụng <strong>HyperMirror Pro</strong> trên điện thoại Android của bạn.
+            </p>
+            <p class="sub-hint">
+              💡 Mẹo: Bạn có thể bấm nút <strong>"🎮 Chạy Luồng Giả Lập 60FPS H.264"</strong> ở cột bên trái để trải nghiệm ngay bộ giải mã GPU độ trễ thấp trên PC!
+            </p>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
