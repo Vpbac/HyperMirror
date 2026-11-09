@@ -10,6 +10,7 @@
  */
 
 const net = require("net");
+const dgram = require("dgram");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -397,6 +398,9 @@ function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
 
       if (universalDecoderProcess && universalDecoderProcess.stdin && !universalDecoderProcess.stdin.destroyed) {
         try {
+          if (frameType === FRAME_TYPE_KEYFRAME && cachedConfigFrame) {
+            universalDecoderProcess.stdin.write(cachedConfigFrame);
+          }
           universalDecoderProcess.stdin.write(payload);
         } catch (_) {}
       }
@@ -476,18 +480,39 @@ function connectToPhoneServer(host = "127.0.0.1", port = STREAM_PORT, label = "U
   });
 }
 
-// 3. Automatic Background USB ADB Tunnel Setup every 2.5 seconds when disconnected
+// 3. Automatic Background USB ADB Tunnel + UDP Wi-Fi Auto-Discovery Broadcast
+const udpBeacon = dgram.createSocket("udp4");
+udpBeacon.on("error", () => {});
+udpBeacon.bind(0, () => {
+  try {
+    udpBeacon.setBroadcast(true);
+  } catch (_) {}
+});
+
 setInterval(() => {
+  // Broadcast PC presence on Wi-Fi LAN so Android phones auto-fill the PC IP
+  const msg = Buffer.from(`GMIR_PC_HERE:${STREAM_PORT}`);
+  try {
+    udpBeacon.send(msg, 27185, "255.255.255.255");
+    for (const item of getLocalLanIps()) {
+      const parts = item.address.split(".");
+      if (parts.length === 4) {
+        parts[3] = "255";
+        udpBeacon.send(msg, 27185, parts.join("."));
+      }
+    }
+  } catch (_) {}
+
   if (activePhoneSocket && !activePhoneSocket.destroyed) return;
   exec(
-    `${ADB_CMD} forward tcp:27184 tcp:${STREAM_PORT} && ${ADB_CMD} reverse tcp:${STREAM_PORT} tcp:${STREAM_PORT}`,
+    `${ADB_CMD} forward tcp:27184 tcp:27184 && ${ADB_CMD} reverse tcp:${STREAM_PORT} tcp:${STREAM_PORT}`,
     (err) => {
       if (!err && (!activePhoneSocket || activePhoneSocket.destroyed)) {
         connectToPhoneServer("127.0.0.1", 27184, "Auto USB Cable").catch(() => {});
       }
     }
   );
-}, 2500);
+}, 2000);
 
 // 4. Native FFplay Direct3D Window
 function toggleNativeFfplayWindow() {
@@ -662,7 +687,7 @@ function toggleBuiltInSimulator(fps = 60, bitrateMbps = 12) {
 function setupUsbAdbTunnel() {
   return new Promise((resolve) => {
     exec(
-      `${ADB_CMD} forward tcp:27184 tcp:${STREAM_PORT} && ${ADB_CMD} reverse tcp:${STREAM_PORT} tcp:${STREAM_PORT}`,
+      `${ADB_CMD} forward tcp:27184 tcp:27184 && ${ADB_CMD} reverse tcp:${STREAM_PORT} tcp:${STREAM_PORT}`,
       (err, stdout, stderr) => {
         if (err) {
           resolve({

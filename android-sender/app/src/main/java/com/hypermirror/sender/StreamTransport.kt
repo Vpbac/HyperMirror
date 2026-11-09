@@ -10,6 +10,8 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -21,6 +23,9 @@ class StreamTransport(
 ) {
     companion object {
         private const val TAG = "StreamTransport"
+        const val PC_SERVER_PORT = 27183
+        const val PHONE_SERVER_PORT = 27184 // Tách biệt hoàn toàn với cổng 27183 để không bao giờ tự kết nối vào chính mình!
+
         const val FRAME_TYPE_CONFIG: Byte = 0x01
         const val FRAME_TYPE_KEYFRAME: Byte = 0x02
         const val FRAME_TYPE_NORMAL: Byte = 0x03
@@ -30,6 +35,13 @@ class StreamTransport(
         const val CMD_SET_BITRATE: Byte = 0x11
         const val CMD_PONG: Byte = 0x12
     }
+
+    private data class QueuedFrame(
+        val frameType: Byte,
+        val ptsUs: Long,
+        val encodeDurationUs: Int,
+        val data: ByteArray
+    )
 
     private val running = AtomicBoolean(false)
     private var serverSocket: ServerSocket? = null
@@ -43,6 +55,9 @@ class StreamTransport(
     private val writeLock = Any()
     private val socketSwitchLock = Any()
 
+    // Hàng đợi tối đa 6 frame: không bao giờ làm treo luồng MediaCodec và tự xả frame cũ nếu mạng lag
+    private val frameQueue = ArrayBlockingQueue<QueuedFrame>(6)
+
     @Volatile
     var latestRttMs: Double = 0.0
         private set
@@ -53,28 +68,42 @@ class StreamTransport(
     private var cachedConfigNal: ByteArray? = null
 
     @Volatile
-    private var streamWidth: Int = 720
+    private var streamWidth: Int = 1920
 
     @Volatile
-    private var streamHeight: Int = 1280
+    private var streamHeight: Int = 1080
 
     fun start(width: Int, height: Int) {
         streamWidth = width
         streamHeight = height
         if (running.getAndSet(true)) return
 
-        // Luồng 1: Luôn mở cổng TCP Server (:27183) để PC kết nối qua `adb forward` hoặc qua IP điện thoại
+        // Luồng gửi gói tin bất đồng bộ (Non-blocking Sender Thread)
+        Thread({
+            while (running.get()) {
+                try {
+                    val pkt = frameQueue.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                    val out = outputStream ?: continue
+                    sendFrameInternal(out, pkt.frameType, pkt.ptsUs, pkt.encodeDurationUs, pkt.data)
+                } catch (e: Exception) {
+                    droppedFrames.incrementAndGet()
+                    closeActiveSocketOnly()
+                }
+            }
+        }, "HyperMirror-AsyncWriter").start()
+
+        // Luồng 1: Mở cổng TCP Server trên PHONE_SERVER_PORT (27184) cho cáp USB (adb forward tcp:27184 tcp:27184)
         Thread({
             try {
                 val srv = ServerSocket()
                 srv.reuseAddress = true
-                srv.bind(InetSocketAddress("0.0.0.0", config.targetPort))
+                srv.bind(InetSocketAddress("0.0.0.0", PHONE_SERVER_PORT))
                 serverSocket = srv
-                Log.i(TAG, "Server listening on 0.0.0.0:${config.targetPort}")
+                Log.i(TAG, "Phone USB Server listening on 0.0.0.0:$PHONE_SERVER_PORT")
 
                 while (running.get()) {
                     val incoming = srv.accept()
-                    Log.i(TAG, "Accepted incoming connection from PC: ${incoming.remoteSocketAddress}")
+                    Log.i(TAG, "Accepted incoming PC connection: ${incoming.remoteSocketAddress}")
                     Thread({
                         handleConnectedSocket(incoming)
                     }, "HyperMirror-ServerSession").start()
@@ -86,13 +115,15 @@ class StreamTransport(
             }
         }, "HyperMirror-ServerAccept").start()
 
-        // Luồng 2: Song song tự động chủ động kết nối tới PC qua USB Reverse (127.0.0.1) hoặc Wi-Fi IP (192.168.1.10)
+        // Luồng 2: Chủ động kết nối tới PC_SERVER_PORT (27183) qua Wi-Fi IP (VD: 192.168.10.5:27183) hoặc USB Reverse (127.0.0.1:27183)
+        // Vì cổng Server trên điện thoại là 27184 còn cổng kết nối đi là 27183, điện thoại KHÔNG BAO GIỜ tự kết nối vào chính nó!
         Thread({
-            val targets = mutableListOf("127.0.0.1")
+            val targets = mutableListOf<String>()
             val trimmedHost = config.targetHost.trim()
             if (trimmedHost.isNotEmpty() && trimmedHost != "127.0.0.1") {
                 targets.add(trimmedHost)
             }
+            targets.add("127.0.0.1")
 
             var idx = 0
             while (running.get()) {
@@ -101,25 +132,24 @@ class StreamTransport(
                     idx++
                     try {
                         val sock = Socket()
-                        sock.connect(InetSocketAddress(hostToTry, config.targetPort), 1200)
-                        Log.i(TAG, "Actively connected to PC at $hostToTry:${config.targetPort}")
+                        sock.connect(InetSocketAddress(hostToTry, PC_SERVER_PORT), 1200)
+                        Log.i(TAG, "Connected to PC Server at $hostToTry:$PC_SERVER_PORT")
                         handleConnectedSocket(sock)
                     } catch (_: Exception) {
                     }
                 }
                 try {
-                    Thread.sleep(1000)
+                    Thread.sleep(800)
                 } catch (_: InterruptedException) {
                     break
                 }
             }
-        }, "HyperMirror-ClientAutoConnect").start()
+        }, "HyperMirror-ClientConnect").start()
     }
 
     private fun handleConnectedSocket(socket: Socket) {
         val out: DataOutputStream
         synchronized(socketSwitchLock) {
-            // Nếu đã có kết nối đang hoạt động ổn định thì bỏ qua kết nối trùng lặp
             val existing = activeSocket
             if (existing != null && existing.isConnected && !existing.isClosed) {
                 try {
@@ -129,6 +159,7 @@ class StreamTransport(
                 return
             }
             configureLowLatencySocket(socket)
+            frameQueue.clear()
             activeSocket = socket
             out = DataOutputStream(BufferedOutputStream(socket.getOutputStream(), 64 * 1024))
             outputStream = out
@@ -164,7 +195,7 @@ class StreamTransport(
             socket.tcpNoDelay = true
             socket.keepAlive = true
             socket.trafficClass = 0x10 or 0x08
-            socket.sendBufferSize = 256 * 1024
+            socket.sendBufferSize = 512 * 1024
             socket.receiveBufferSize = 32 * 1024
         } catch (_: Exception) {
         }
@@ -190,12 +221,17 @@ class StreamTransport(
         if (frameType == FRAME_TYPE_CONFIG) {
             cachedConfigNal = data.clone()
         }
-        val out = outputStream ?: return
-        try {
-            sendFrameInternal(out, frameType, ptsUs, encodeDurationUs, data)
-        } catch (e: Exception) {
+        if (outputStream == null) return
+
+        val item = QueuedFrame(frameType, ptsUs, encodeDurationUs, data)
+        if (!frameQueue.offer(item)) {
+            // Nếu hàng đợi đầy do mạng Wi-Fi khựng nhẹ, bỏ frame cũ nhất và yêu cầu IDR mới để giữ độ trễ = 0
+            frameQueue.poll()
+            frameQueue.offer(item)
             droppedFrames.incrementAndGet()
-            closeActiveSocketOnly()
+            if (frameType != FRAME_TYPE_KEYFRAME && frameType != FRAME_TYPE_CONFIG) {
+                onRequestSyncFrame()
+            }
         }
     }
 
@@ -256,6 +292,7 @@ class StreamTransport(
 
     private fun closeActiveSocketOnly() {
         synchronized(writeLock) {
+            frameQueue.clear()
             try {
                 outputStream?.close()
             } catch (_: Exception) {

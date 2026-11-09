@@ -18,14 +18,19 @@ import androidx.lifecycle.lifecycleScope
 import com.hypermirror.sender.databinding.ActivityMainBinding
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private var mirrorService: MirrorForegroundService? = null
     private var serviceBound = false
+    private val discoveryActive = AtomicBoolean(false)
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -66,10 +71,21 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        binding.tvDeviceIp.text = "IP Thiết bị: ${getDeviceWifiIp()} • Cổng TCP: 27183"
+        val phoneIp = getDeviceWifiIp()
+        binding.tvDeviceIp.text = "IP Điện thoại: $phoneIp • Tự động tìm PC trên Wi-Fi"
+
+        val prefs = getSharedPreferences("hypermirror_prefs", Context.MODE_PRIVATE)
+        val savedIp = prefs.getString("last_pc_ip", "") ?: ""
+        if (savedIp.isNotEmpty()) {
+            binding.etTargetIp.setText(savedIp)
+        } else if (phoneIp.startsWith("192.168.")) {
+            val prefix = phoneIp.substringBeforeLast(".")
+            binding.etTargetIp.setText("$prefix.5")
+        }
 
         setupUiListeners()
         observeTelemetry()
+        startPcUdpDiscovery()
     }
 
     override fun onStart() {
@@ -85,6 +101,57 @@ class MainActivity : AppCompatActivity() {
             unbindService(serviceConnection)
             serviceBound = false
         }
+    }
+
+    override fun onDestroy() {
+        discoveryActive.set(false)
+        super.onDestroy()
+    }
+
+    /**
+     * Tự động nhận diện địa chỉ IP của PC Receiver qua gói tin UDP Broadcast cổng 27185
+     */
+    private fun startPcUdpDiscovery() {
+        if (discoveryActive.getAndSet(true)) return
+        Thread({
+            var udpSocket: DatagramSocket? = null
+            try {
+                udpSocket = DatagramSocket(null).apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(27185))
+                    soTimeout = 2000
+                }
+                val buf = ByteArray(128)
+                while (discoveryActive.get()) {
+                    try {
+                        val pkt = DatagramPacket(buf, buf.size)
+                        udpSocket.receive(pkt)
+                        val msg = String(pkt.data, 0, pkt.length, Charsets.UTF_8).trim()
+                        if (msg.startsWith("GMIR_PC_HERE")) {
+                            val discoveredIp = pkt.address?.hostAddress ?: continue
+                            runOnUiThread {
+                                val currentText = binding.etTargetIp.text.toString().trim()
+                                if (currentText != discoveredIp && !MirrorForegroundService.isRunningFlow.value) {
+                                    binding.etTargetIp.setText(discoveredIp)
+                                    binding.rbWifiClient.isChecked = true
+                                    getSharedPreferences("hypermirror_prefs", Context.MODE_PRIVATE)
+                                        .edit()
+                                        .putString("last_pc_ip", discoveredIp)
+                                        .apply()
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                try {
+                    udpSocket?.close()
+                } catch (_: Exception) {
+                }
+            }
+        }, "HyperMirror-UdpDiscovery").start()
     }
 
     private fun setupUiListeners() {
@@ -108,6 +175,13 @@ class MainActivity : AppCompatActivity() {
                 }
                 startService(stopIntent)
             } else {
+                val targetIp = binding.etTargetIp.text.toString().trim()
+                if (targetIp.isNotEmpty()) {
+                    getSharedPreferences("hypermirror_prefs", Context.MODE_PRIVATE)
+                        .edit()
+                        .putString("last_pc_ip", targetIp)
+                        .apply()
+                }
                 val projectionManager =
                     getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                 capturePermissionLauncher.launch(projectionManager.createScreenCaptureIntent())
@@ -140,7 +214,7 @@ class MainActivity : AppCompatActivity() {
                 val statusText = if (stats.connected) {
                     "ĐANG KẾT NỐI: ${stats.clientAddress}"
                 } else if (MirrorForegroundService.isRunningFlow.value) {
-                    "ĐANG CHỜ PC KẾT NỐI (:27183)..."
+                    "ĐANG KẾT NỐI TỚI PC..."
                 } else {
                     "TRẠNG THÁI: SẴN SÀNG"
                 }

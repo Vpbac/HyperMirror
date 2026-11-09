@@ -294,6 +294,10 @@
       waitingForKeyFrame = true;
       return true;
     } catch (_) {
+      if (codecId === 2) {
+        // Browser WebCodecs does not support HEVC Annex-B; let Universal FFmpeg decoder render frames
+        return false;
+      }
       try {
         videoDecoder.configure({
           codec: "avc1.42e01f",
