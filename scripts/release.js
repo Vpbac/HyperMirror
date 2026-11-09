@@ -12,10 +12,12 @@ function getGitToken() {
   if (process.env.GH_TOKEN) return process.env.GH_TOKEN;
   if (process.env.GITHUB_TOKEN) return process.env.GITHUB_TOKEN;
   try {
-    const cred = execSync('cmd.exe /c "(echo protocol=https & echo host=github.com & echo.) | git credential fill"', {
-      stdio: ["pipe", "pipe", "ignore"],
-    }).toString();
-    const match = cred.match(/^password=(.+)$/m);
+    const { spawnSync } = require("child_process");
+    const res = spawnSync("git", ["credential", "fill"], {
+      input: "protocol=https\nhost=github.com\n\n",
+      encoding: "utf8",
+    });
+    const match = (res.stdout || "").match(/^password=(.+)$/m);
     if (match) return match[1].trim();
   } catch (_) {}
   return null;
