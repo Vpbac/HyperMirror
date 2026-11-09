@@ -21,11 +21,21 @@
   const btnConnectPhone = document.getElementById("btnConnectPhone");
   const connectionToast = document.getElementById("connectionToast");
 
+  // Orientation / Crop / Fullscreen controls
+  const btnCropLandscape = document.getElementById("btnCropLandscape");
+  const btnRotate = document.getElementById("btnRotate");
+  const btnScaleMode = document.getElementById("btnScaleMode");
+  const btnFullscreen = document.getElementById("btnFullscreen");
+  const btnQuickCinema = document.getElementById("btnQuickCinema");
+  const btnFloatCrop = document.getElementById("btnFloatCrop");
+  const btnFloatRotate = document.getElementById("btnFloatRotate");
+  const btnFloatScale = document.getElementById("btnFloatScale");
+  const btnFloatExitFs = document.getElementById("btnFloatExitFs");
+
   const sliderBitrate = document.getElementById("sliderBitrate");
   const lblBitrateVal = document.getElementById("lblBitrateVal");
   const presetChips = document.querySelectorAll(".btn-chip");
   const btnForceIdr = document.getElementById("btnForceIdr");
-  const btnFullscreen = document.getElementById("btnFullscreen");
   const btnNativeFfplay = document.getElementById("btnNativeFfplay");
   const btnSimulator = document.getElementById("btnSimulator");
   const viewportContainer = document.getElementById("viewportContainer");
@@ -37,6 +47,13 @@
   let lastWebCodecsFrameTime = 0;
   let isRenderingBitmap = false;
 
+  // Viewport Transform State
+  let cropLandscape16x9 = false; // Cuts top/bottom black bars when phone streams a landscape game inside a portrait frame
+  let rotationDeg = 0; // 0, 90, 180, 270
+  const scaleModes = ["contain", "cover", "fill"];
+  const scaleLabels = ["Vừa khít (Z)", "Lấp đầy (Z)", "1920×1080 (Z)"];
+  let scaleIndex = 0;
+
   // Telemetry accumulators
   let frameCountWindow = 0;
   let byteCountWindow = 0;
@@ -46,8 +63,126 @@
   const pendingDecodeTimestamps = new Map();
 
   function setToast(msg) {
-    connectionToast.textContent = msg;
+    if (connectionToast) connectionToast.textContent = msg;
   }
+
+  /**
+   * Central GPU Canvas Renderer supporting:
+   * 1. Auto/Manual 16:9 Center Game Crop (removes top & bottom black bars from portrait stream)
+   * 2. 0° / 90° / 180° / 270° Rotation
+   * 3. 1920x1080 Fullscreen Scaling
+   */
+  function drawVideoSourceToCanvas(source, rawW, rawH) {
+    let sx = 0;
+    let sy = 0;
+    let sw = rawW;
+    let sh = rawH;
+
+    // If Crop Black Bars 16:9 is active and source is Portrait (e.g. 1080x1920 with horizontal game in middle)
+    if (cropLandscape16x9 && rawH > rawW) {
+      sh = Math.round((rawW * 9) / 16);
+      sy = Math.max(0, Math.round((rawH - sh) / 2));
+    } else if (cropLandscape16x9 && rawW > rawH) {
+      // If source is already Landscape but has minor pillarbox/letterbox, crop to 16:9
+      const targetH = Math.round((rawW * 9) / 16);
+      if (targetH < rawH) {
+        sh = targetH;
+        sy = Math.round((rawH - sh) / 2);
+      }
+    }
+
+    const isRotated90 = rotationDeg === 90 || rotationDeg === 270;
+    const outW = cropLandscape16x9
+      ? 1920
+      : isRotated90
+      ? sh
+      : sw;
+    const outH = cropLandscape16x9
+      ? 1080
+      : isRotated90
+      ? sw
+      : sh;
+
+    if (canvas.width !== outW || canvas.height !== outH) {
+      canvas.width = outW;
+      canvas.height = outH;
+    }
+
+    ctx.save();
+    if (rotationDeg === 0) {
+      ctx.drawImage(source, sx, sy, sw, sh, 0, 0, outW, outH);
+    } else {
+      ctx.translate(outW / 2, outH / 2);
+      ctx.rotate((rotationDeg * Math.PI) / 180);
+      if (isRotated90) {
+        ctx.drawImage(source, sx, sy, sw, sh, -outH / 2, -outW / 2, outH, outW);
+      } else {
+        ctx.drawImage(source, sx, sy, sw, sh, -outW / 2, -outH / 2, outW, outH);
+      }
+    }
+    ctx.restore();
+  }
+
+  function toggleCropLandscape() {
+    cropLandscape16x9 = !cropLandscape16x9;
+    if (btnCropLandscape) {
+      btnCropLandscape.classList.toggle("active", cropLandscape16x9);
+      btnCropLandscape.textContent = cropLandscape16x9
+        ? "✂️ Đang Cắt Viền 16:9 (C)"
+        : "✂️ Cắt Viền Đen 16:9 (C)";
+    }
+    if (btnFloatCrop) {
+      btnFloatCrop.textContent = cropLandscape16x9
+        ? "✂️ Tắt Cắt Viền (C)"
+        : "✂️ Cắt Viền Đen (C)";
+    }
+    setToast(
+      cropLandscape16x9
+        ? "Đã bật Cắt Viền Đen 16:9: Khung game ngang được phóng chuẩn 1920×1080!"
+        : "Đã tắt Cắt Viền Đen 16:9 (hiển thị khung gốc)."
+    );
+  }
+
+  function rotateCanvas90() {
+    rotationDeg = (rotationDeg + 90) % 360;
+    if (btnRotate) {
+      btnRotate.textContent = `🔄 Xoay 90° (${rotationDeg}°)`;
+    }
+    if (btnFloatRotate) {
+      btnFloatRotate.textContent = `🔄 Xoay (${rotationDeg}°)`;
+    }
+    setToast(`Đã xoay khung hình sang ${rotationDeg}°.`);
+  }
+
+  function cycleScaleMode() {
+    scaleIndex = (scaleIndex + 1) % scaleModes.length;
+    canvas.classList.remove("scale-cover", "scale-fill");
+    if (scaleModes[scaleIndex] === "cover") {
+      canvas.classList.add("scale-cover");
+    } else if (scaleModes[scaleIndex] === "fill") {
+      canvas.classList.add("scale-fill");
+    }
+    if (btnScaleMode) {
+      btnScaleMode.textContent = `⤢ Khung: ${scaleLabels[scaleIndex]}`;
+    }
+    setToast(`Chế độ khung hình: ${scaleLabels[scaleIndex]}`);
+  }
+
+  function toggleTrueFullscreen() {
+    if (!document.fullscreenElement) {
+      document.body.classList.add("cinema-mode");
+      viewportContainer.requestFullscreen().catch(() => {});
+    } else {
+      document.exitFullscreen().catch(() => {});
+      document.body.classList.remove("cinema-mode");
+    }
+  }
+
+  document.addEventListener("fullscreenchange", () => {
+    if (!document.fullscreenElement) {
+      document.body.classList.remove("cinema-mode");
+    }
+  });
 
   function detectH264CodecString(u8) {
     for (let i = 0; i < u8.length - 7; i++) {
@@ -138,15 +273,7 @@
           pendingDecodeTimestamps.delete(frame.timestamp);
         }
 
-        if (
-          canvas.width !== frame.displayWidth ||
-          canvas.height !== frame.displayHeight
-        ) {
-          canvas.width = frame.displayWidth;
-          canvas.height = frame.displayHeight;
-        }
-
-        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+        drawVideoSourceToCanvas(frame, frame.displayWidth, frame.displayHeight);
         frame.close();
 
         emptyOverlay.classList.add("hidden");
@@ -182,7 +309,6 @@
   }
 
   async function renderUniversalJpegFrame(jpegBytes, encodeDurationUs) {
-    // Only render universal decoded frame if WebCodecs hasn't rendered within the last 250ms
     if (performance.now() - lastWebCodecsFrameTime < 250) {
       return;
     }
@@ -192,11 +318,7 @@
     try {
       const blob = new Blob([jpegBytes], { type: "image/jpeg" });
       const bmp = await createImageBitmap(blob);
-      if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
-        canvas.width = bmp.width;
-        canvas.height = bmp.height;
-      }
-      ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+      drawVideoSourceToCanvas(bmp, bmp.width, bmp.height);
       bmp.close();
 
       emptyOverlay.classList.add("hidden");
@@ -212,8 +334,8 @@
   function handleBinaryVideoPacket(arrayBuffer) {
     if (arrayBuffer.byteLength <= 14) return;
     const view = new DataView(arrayBuffer);
-    const frameType = view.getUint8(0); // 1=Config, 2=Keyframe, 3=Normal, 5=Universal JPEG
-    const codecId = view.getUint8(1); // 1=H264, 2=H265
+    const frameType = view.getUint8(0);
+    const codecId = view.getUint8(1);
     const ptsUs = Number(view.getBigInt64(2, false));
     const encodeDurationUs = view.getUint32(10, false);
     const payloadBytes = new Uint8Array(arrayBuffer, 14);
@@ -416,11 +538,43 @@
     setToast("Đã gửi lệnh ép xuất khung hình IDR (KeyFrame) tức thì!");
   });
 
-  btnFullscreen.addEventListener("click", () => {
-    if (!document.fullscreenElement) {
-      viewportContainer.requestFullscreen().catch(() => {});
-    } else {
-      document.exitFullscreen().catch(() => {});
+  // Orientation, Crop, Scale & Fullscreen Buttons
+  if (btnCropLandscape) btnCropLandscape.addEventListener("click", toggleCropLandscape);
+  if (btnFloatCrop) btnFloatCrop.addEventListener("click", toggleCropLandscape);
+
+  if (btnRotate) btnRotate.addEventListener("click", rotateCanvas90);
+  if (btnFloatRotate) btnFloatRotate.addEventListener("click", rotateCanvas90);
+
+  if (btnScaleMode) btnScaleMode.addEventListener("click", cycleScaleMode);
+  if (btnFloatScale) btnFloatScale.addEventListener("click", cycleScaleMode);
+
+  if (btnFullscreen) btnFullscreen.addEventListener("click", toggleTrueFullscreen);
+  if (btnFloatExitFs) btnFloatExitFs.addEventListener("click", toggleTrueFullscreen);
+
+  if (btnQuickCinema) {
+    btnQuickCinema.addEventListener("click", () => {
+      document.body.classList.toggle("cinema-mode");
+    });
+  }
+
+  // Double-click anywhere on video viewport to enter/exit True 1920x1080 Fullscreen
+  viewportContainer.addEventListener("dblclick", toggleTrueFullscreen);
+
+  // Keyboard shortcuts for gaming: C (Crop 16:9), R (Rotate 90°), Z (Scale), F / F11 (Fullscreen), H (Hide Sidebar)
+  window.addEventListener("keydown", (e) => {
+    if (e.target && e.target.tagName === "INPUT") return;
+    const key = e.key.toLowerCase();
+    if (key === "c") {
+      toggleCropLandscape();
+    } else if (key === "r") {
+      rotateCanvas90();
+    } else if (key === "z") {
+      cycleScaleMode();
+    } else if (key === "f" || e.key === "F11") {
+      e.preventDefault();
+      toggleTrueFullscreen();
+    } else if (key === "h") {
+      document.body.classList.toggle("cinema-mode");
     }
   });
 

@@ -31,13 +31,22 @@ body {
   height: 100vh;
 }
 
+body.cinema-mode .app-layout {
+  grid-template-columns: 1fr;
+}
+
+body.cinema-mode .sidebar,
+body.cinema-mode .hud-bar {
+  display: none !important;
+}
+
 .sidebar {
   background: var(--bg-panel);
   border-right: 1px solid var(--border-subtle);
-  padding: 18px;
+  padding: 16px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
   overflow-y: auto;
 }
 
@@ -50,11 +59,11 @@ body {
   background: var(--cyan);
   padding: 3px 8px;
   border-radius: 4px;
-  margin-bottom: 6px;
+  margin-bottom: 4px;
 }
 
 .brand h1 {
-  font-size: 22px;
+  font-size: 21px;
   font-weight: 900;
   letter-spacing: 0.5px;
 }
@@ -73,10 +82,10 @@ body {
   background: var(--bg-card);
   border: 1px solid var(--border-subtle);
   border-radius: 10px;
-  padding: 14px;
+  padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 
 .card h2 {
@@ -90,7 +99,7 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  font-size: 13px;
+  font-size: 12.5px;
 }
 
 .highlight-cyan {
@@ -106,8 +115,8 @@ body {
 .btn {
   border: none;
   border-radius: 8px;
-  padding: 10px 12px;
-  font-size: 13px;
+  padding: 9px 10px;
+  font-size: 12.5px;
   font-weight: 700;
   cursor: pointer;
   transition: all 0.15s ease;
@@ -124,7 +133,6 @@ body {
 
 .btn-primary:hover {
   filter: brightness(1.1);
-  transform: translateY(-1px);
 }
 
 .btn-secondary {
@@ -139,6 +147,11 @@ body {
 .btn-accent {
   background: linear-gradient(135deg, #7c4dff 0%, #536dfe 100%);
   color: #fff;
+}
+
+.btn-accent.active {
+  background: linear-gradient(135deg, #00e676 0%, #00c853 100%);
+  color: #041208;
 }
 
 .btn-sim {
@@ -174,7 +187,7 @@ body {
   background: var(--bg-dark);
   border: 1px solid var(--border-subtle);
   border-radius: 6px;
-  padding: 8px 10px;
+  padding: 7px 10px;
   color: var(--text-main);
   font-size: 12px;
 }
@@ -183,7 +196,7 @@ body {
   font-size: 11.5px;
   color: var(--text-muted);
   background: rgba(0, 0, 0, 0.25);
-  padding: 7px 9px;
+  padding: 6px 9px;
   border-radius: 6px;
   line-height: 1.4;
 }
@@ -191,7 +204,7 @@ body {
 .slider-header {
   display: flex;
   justify-content: space-between;
-  font-size: 12.5px;
+  font-size: 12px;
 }
 
 input[type="range"] {
@@ -228,49 +241,34 @@ input[type="range"] {
   gap: 8px;
 }
 
-.tech-list {
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  font-size: 11.5px;
-  color: var(--text-muted);
-}
-
-.tech-list strong {
-  color: var(--text-main);
-}
-
-.dot {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  margin-right: 5px;
-}
-
-.dot.green {
-  background: var(--green);
-  box-shadow: 0 0 6px var(--green);
-}
-
 /* Main Stage */
 .main-stage {
   display: flex;
   flex-direction: column;
   height: 100vh;
-  background: radial-gradient(circle at center, #0d1527 0%, #050811 100%);
+  background: #000;
 }
 
 .hud-bar {
-  height: 58px;
-  background: rgba(15, 22, 38, 0.9);
+  height: 54px;
+  background: rgba(15, 22, 38, 0.95);
   border-bottom: 1px solid var(--border-subtle);
-  padding: 0 20px;
+  padding: 0 18px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
+}
+
+.btn-hud {
+  background: rgba(0, 240, 255, 0.12);
+  border: 1px solid rgba(0, 240, 255, 0.35);
+  color: var(--cyan);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
 }
 
 .hud-pill {
@@ -278,7 +276,7 @@ input[type="range"] {
   align-items: center;
   gap: 8px;
   background: rgba(255, 255, 255, 0.05);
-  padding: 6px 12px;
+  padding: 5px 12px;
   border-radius: 999px;
   font-size: 12px;
   font-weight: 700;
@@ -305,11 +303,11 @@ input[type="range"] {
 .hud-metric .label {
   font-size: 10px;
   color: var(--text-muted);
-  letter-spacing: 0.6px;
+  letter-spacing: 0.5px;
 }
 
 .hud-metric strong {
-  font-size: 14px;
+  font-size: 13.5px;
   font-family: "Consolas", monospace;
 }
 
@@ -320,18 +318,64 @@ input[type="range"] {
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  padding: 12px;
+  background: #000;
+  width: 100%;
+  height: 100%;
 }
 
 #mirrorCanvas {
-  max-width: 100%;
-  max-height: 100%;
-  width: auto;
-  height: auto;
+  width: 100%;
+  height: 100%;
   object-fit: contain;
-  border-radius: 8px;
-  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.75);
   background: #000;
+  display: block;
+}
+
+#mirrorCanvas.scale-cover {
+  object-fit: cover !important;
+}
+
+#mirrorCanvas.scale-fill {
+  object-fit: fill !important;
+}
+
+/* Floating toolbar when hovering near top in Fullscreen / Cinema mode */
+.floating-controls {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 8px;
+  background: rgba(15, 22, 38, 0.88);
+  border: 1px solid rgba(0, 240, 255, 0.3);
+  padding: 6px 12px;
+  border-radius: 999px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+  z-index: 30;
+}
+
+.viewport-container:hover .floating-controls {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.btn-float {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: #fff;
+  padding: 5px 11px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.btn-float:hover {
+  border-color: var(--cyan);
+  color: var(--cyan);
 }
 
 .empty-overlay {
@@ -340,8 +384,9 @@ input[type="range"] {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(7, 11, 20, 0.84);
+  background: rgba(7, 11, 20, 0.86);
   backdrop-filter: blur(6px);
+  z-index: 20;
 }
 
 .empty-overlay.hidden {
@@ -349,12 +394,12 @@ input[type="range"] {
 }
 
 .empty-box {
-  max-width: 520px;
+  max-width: 560px;
   text-align: center;
   background: var(--bg-card);
   border: 1px solid var(--border-subtle);
   border-radius: 14px;
-  padding: 28px;
+  padding: 26px;
 }
 
 .empty-box h3 {
@@ -364,7 +409,7 @@ input[type="range"] {
 }
 
 .empty-box p {
-  font-size: 13.5px;
+  font-size: 13px;
   color: var(--text-muted);
   line-height: 1.55;
   margin-bottom: 12px;
@@ -376,6 +421,7 @@ input[type="range"] {
   padding: 10px;
   border-radius: 8px;
   color: var(--text-main) !important;
+  text-align: left;
 }
 
 .pulse-ring {

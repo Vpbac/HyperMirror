@@ -7,9 +7,9 @@
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
-  <div class="app-layout">
+  <div class="app-layout" id="appLayout">
     <!-- Left Sidebar: Connection & Low-Latency Controls -->
-    <aside class="sidebar">
+    <aside class="sidebar" id="sidebar">
       <div class="brand">
         <div class="brand-badge">ZERO-LATENCY ENGINE</div>
         <h1>HYPERMIRROR <span>PRO</span></h1>
@@ -44,53 +44,60 @@
         <div id="connectionToast" class="toast-msg">Sẵn sàng nhận kết nối từ App Android HyperMirror</div>
       </section>
 
+      <!-- Orientation, Rotate, Crop & Fullscreen Section -->
+      <section class="card">
+        <h2>2. XOAY NGANG, CẮT VIỀN ĐEN &amp; FULLSCREEN 1920×1080</h2>
+        <div class="action-grid">
+          <button id="btnCropLandscape" class="btn btn-accent" title="Cắt bỏ 2 viền đen trên dưới khi điện thoại phát khung dọc (Phím C)">
+            ✂️ Cắt Viền Đen 16:9 (C)
+          </button>
+          <button id="btnRotate" class="btn btn-secondary" title="Xoay khung hình 90 độ (Phím R)">
+            🔄 Xoay 90° (0°)
+          </button>
+        </div>
+        <div class="action-grid">
+          <button id="btnScaleMode" class="btn btn-outline" title="Đổi chế độ lấp đầy màn hình 1920x1080 (Phím Z)">
+            ⤢ Khung: Vừa khít (Z)
+          </button>
+          <button id="btnFullscreen" class="btn btn-primary" title="Toàn màn hình 1920x1080 thực (Phím F / F11 / Nhấp đúp chuột)">
+            ⛶ Fullscreen 1080p (F)
+          </button>
+        </div>
+      </section>
+
       <!-- Live Gaming Optimization Section -->
       <section class="card">
-        <h2>2. TỐI ƯU FPS &amp; BITRATE TRỰC TIẾP</h2>
+        <h2>3. TỐI ƯU FPS &amp; BITRATE TRỰC TIẾP</h2>
         <div class="slider-header">
           <span>Bitrate Mục tiêu (Live CBR):</span>
           <strong id="lblBitrateVal" class="highlight-green">16 Mbps</strong>
         </div>
         <input id="sliderBitrate" type="range" min="2" max="40" step="1" value="16" />
         <div class="preset-row">
-          <button class="btn-chip" data-mbps="8">8 Mbps (Wi-Fi ổn định)</button>
+          <button class="btn-chip" data-mbps="8">8 Mbps (Wi-Fi)</button>
           <button class="btn-chip active" data-mbps="16">16 Mbps (Esports)</button>
-          <button class="btn-chip" data-mbps="32">32 Mbps (Cáp USB Ultra)</button>
+          <button class="btn-chip" data-mbps="32">32 Mbps (USB Ultra)</button>
         </div>
 
-        <div class="action-grid">
-          <button id="btnForceIdr" class="btn btn-outline">🔄 Làm tươi Khung hình (IDR)</button>
-          <button id="btnFullscreen" class="btn btn-outline">⛶ Toàn màn hình</button>
-        </div>
+        <button id="btnForceIdr" class="btn btn-outline">🔄 Làm tươi Khung hình (IDR)</button>
       </section>
 
       <!-- Dual Render Mode & Built-in Simulator -->
       <section class="card">
-        <h2>3. CHẾ ĐỘ HIỂN THỊ &amp; KIỂM THỬ</h2>
-        <button id="btnNativeFfplay" class="btn btn-accent">
+        <h2>4. CHẾ ĐỘ HIỂN THỊ &amp; KIỂM THỬ</h2>
+        <button id="btnNativeFfplay" class="btn btn-outline">
           🚀 Mở cửa sổ Native Direct3D (FFplay Zero-Buffer)
         </button>
         <button id="btnSimulator" class="btn btn-sim">
           🎮 Chạy Luồng Giả Lập 60FPS H.264 (Test Ngay Trên PC)
         </button>
       </section>
-
-      <!-- Latency Architecture Checklist -->
-      <section class="card compact">
-        <h2>CÔNG NGHỆ GIẢM ĐỘ TRỄ ĐANG BẬT</h2>
-        <ul class="tech-list">
-          <li><span class="dot green"></span> <strong>Zero-Copy Surface:</strong> GPU ➔ MediaCodec trực tiếp</li>
-          <li><span class="dot green"></span> <strong>0 B-Frames &amp; KEY_LOW_LATENCY:</strong> Không giữ frame</li>
-          <li><span class="dot green"></span> <strong>TCP_NODELAY + DSCP QoS:</strong> Tắt gom gói Nagle</li>
-          <li><span class="dot green"></span> <strong>WebCodecs GPU + Desynchronized:</strong> Bỏ qua VSync</li>
-        </ul>
-      </section>
     </aside>
 
     <!-- Main Stage: Video Viewport & Live Telemetry HUD -->
-    <main class="main-stage">
+    <main class="main-stage" id="mainStage">
       <!-- Top Telemetry HUD Bar -->
-      <header class="hud-bar">
+      <header class="hud-bar" id="hudBar">
         <div class="hud-pill status-pill" id="hudStatusPill">
           <span class="status-dot" id="hudStatusDot"></span>
           <span id="hudStatusText">CHƯA KẾT NỐI</span>
@@ -112,19 +119,31 @@
         </div>
 
         <div class="hud-metric">
-          <span class="label">ĐỘ TRỄ DSP ENCODE</span>
+          <span class="label">DSP ENCODE</span>
           <strong id="hudEncodeMs">0.00 ms</strong>
         </div>
 
         <div class="hud-metric">
-          <span class="label">ĐỘ TRỄ GIẢI MÃ GPU</span>
+          <span class="label">GPU DECODE</span>
           <strong id="hudDecodeMs">0.00 ms</strong>
         </div>
+
+        <button id="btnQuickCinema" class="btn-hud" title="Ẩn/Hiện thanh bên để xem rộng toàn cửa sổ (Phím H)">
+          Ẩn Menu (H)
+        </button>
       </header>
 
       <!-- Low-Latency Desynchronized Canvas Container -->
-      <div class="viewport-container" id="viewportContainer">
+      <div class="viewport-container" id="viewportContainer" title="Nhấp đúp chuột vào màn hình để bật/tắt Fullscreen 1920×1080">
         <canvas id="mirrorCanvas" width="1920" height="1080"></canvas>
+
+        <!-- Floating Quick Controls in Fullscreen / Cinema Mode -->
+        <div class="floating-controls" id="floatingControls">
+          <button id="btnFloatCrop" class="btn-float">✂️ Cắt Viền Đen (C)</button>
+          <button id="btnFloatRotate" class="btn-float">🔄 Xoay 90° (R)</button>
+          <button id="btnFloatScale" class="btn-float">⤢ Lấp Đầy 16:9 (Z)</button>
+          <button id="btnFloatExitFs" class="btn-float">✕ Thoát Fullscreen (F / Esc)</button>
+        </div>
 
         <!-- Empty State Overlay -->
         <div class="empty-overlay" id="emptyOverlay">
@@ -132,11 +151,12 @@
             <div class="pulse-ring"></div>
             <h3>Đang chờ luồng hình ảnh từ Android (:27183)</h3>
             <p>
-              Cắm cáp USB và nhấn <strong>"⚡ Kết nối Cáp USB"</strong> ở thanh bên trái, hoặc nhập IP
-              PC vào ứng dụng <strong>HyperMirror Pro</strong> trên điện thoại Android của bạn.
+              Cắm cáp USB và nhấn <strong>"⚡ Kết nối Cáp USB"</strong> ở thanh bên trái, hoặc bấm <strong>"Bắt đầu chiếu màn hình"</strong> trên ứng dụng <strong>HyperMirror Pro</strong>.
             </p>
             <p class="sub-hint">
-              💡 Mẹo: Bạn có thể bấm nút <strong>"🎮 Chạy Luồng Giả Lập 60FPS H.264"</strong> ở cột bên trái để trải nghiệm ngay bộ giải mã GPU độ trễ thấp trên PC!
+              💡 <strong>Phím tắt Chơi Game 1920×1080:</strong><br/>
+              • Nhấn <strong>C</strong> (hoặc nút <strong>✂️ Cắt Viền Đen 16:9</strong>): Tự động phóng khung game ngang lấp đầy 1920×1080<br/>
+              • Nhấn <strong>R</strong>: Xoay 90° &nbsp;|&nbsp; Nhấn <strong>Z</strong>: Lấp đầy màn hình &nbsp;|&nbsp; Nhấn <strong>F / F11 / Nhấp đúp chuột</strong>: Fullscreen 100%
             </p>
           </div>
         </div>

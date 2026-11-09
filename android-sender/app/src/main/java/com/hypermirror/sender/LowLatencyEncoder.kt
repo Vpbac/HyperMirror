@@ -37,9 +37,9 @@ class LowLatencyEncoder(
     private var inputSurface: Surface? = null
     private var virtualDisplay: VirtualDisplay? = null
 
-    var encodedWidth: Int = 720
+    var encodedWidth: Int = 1920
         private set
-    var encodedHeight: Int = 1280
+    var encodedHeight: Int = 1080
         private set
     var actualFps: Int = 60
         private set
@@ -57,8 +57,23 @@ class LowLatencyEncoder(
         } else {
             1.0f
         }
-        encodedWidth = align8((rawW * scale).toInt())
-        encodedHeight = align8((rawH * scale).toInt())
+        val scaledA = align8((rawW * scale).toInt())
+        val scaledB = align8((rawH * scale).toInt())
+
+        when (config.orientationMode) {
+            OrientationMode.LANDSCAPE_GAME -> {
+                encodedWidth = max(scaledA, scaledB)
+                encodedHeight = min(scaledA, scaledB)
+            }
+            OrientationMode.PORTRAIT -> {
+                encodedWidth = min(scaledA, scaledB)
+                encodedHeight = max(scaledA, scaledB)
+            }
+            OrientationMode.AUTO_ROTATE -> {
+                encodedWidth = scaledA
+                encodedHeight = scaledB
+            }
+        }
         actualFps = config.fps
     }
 
@@ -115,30 +130,26 @@ class LowLatencyEncoder(
             listOf(MediaFormat.MIMETYPE_VIDEO_AVC)
         }
 
-        val isPortrait = encodedHeight >= encodedWidth
-        val res720W = if (isPortrait) 720 else 1280
-        val res720H = if (isPortrait) 1280 else 720
+        val isLandscape = encodedWidth >= encodedHeight
+        val res1080W = if (isLandscape) 1920 else 1080
+        val res1080H = if (isLandscape) 1080 else 1920
+        val res720W = if (isLandscape) 1280 else 720
+        val res720H = if (isLandscape) 720 else 1280
 
         for (mime in mimesToTry) {
-            // Tầng 1: Độ phân giải mục tiêu + FPS mục tiêu (hoặc 60fps nếu OMX giới hạn)
+            // Tầng 1: Độ phân giải mục tiêu + FPS mục tiêu
             tryConfigureTier(mime, encodedWidth, encodedHeight, config.fps, useExtendedFlags = true)?.let {
                 Log.i(TAG, "Encoder Tier 1 started: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
                 return it
             }
 
-            // Tầng 2: Độ phân giải mục tiêu (căn lề 16) @ 60FPS cơ bản (tương thích Snapdragon OMX)
-            tryConfigureTier(
-                mime,
-                align16(encodedWidth),
-                align16(encodedHeight),
-                min(config.fps, 60),
-                useExtendedFlags = false
-            )?.let {
-                Log.i(TAG, "Encoder Tier 2 started: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
+            // Tầng 2: Chuẩn 1080p (1920x1080 hoặc 1080x1920) @ 60FPS cho Snapdragon OMX
+            tryConfigureTier(mime, res1080W, res1080H, min(config.fps, 60), useExtendedFlags = false)?.let {
+                Log.i(TAG, "Encoder Tier 2 (1080p@60) started: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
                 return it
             }
 
-            // Tầng 3: 720p (720x1280 / 1280x720) @ 60FPS chuẩn phần cứng phổ thông
+            // Tầng 3: Chuẩn 720p (1280x720 hoặc 720x1280) @ 60FPS
             tryConfigureTier(mime, res720W, res720H, 60, useExtendedFlags = false)?.let {
                 Log.i(TAG, "Encoder Tier 3 (720p@60) started: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
                 return it
@@ -171,7 +182,6 @@ class LowLatencyEncoder(
                 videoCaps.bitrateRange.upper
             )
 
-            // Trên OMX (như Snapdragon 835), chỉ bật FPS > 60 nếu phần cứng thực sự hỗ trợ ở độ phân giải đó
             val targetFps = if (!useExtendedFlags) {
                 fps.coerceAtMost(60)
             } else {
@@ -204,7 +214,6 @@ class LowLatencyEncoder(
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
                     }
-                    // Chỉ đặt KEY_LOW_LATENCY nếu bộ mã hóa phần cứng thực sự khai báo hỗ trợ FEATURE_LowLatency
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
                         codecCaps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
                     ) {

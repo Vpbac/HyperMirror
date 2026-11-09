@@ -168,6 +168,12 @@ class MainActivity : AppCompatActivity() {
             TransportMode.CLIENT_CONNECT
         }
 
+        val orientationMode = when {
+            binding.rbOrientLandscape.isChecked -> OrientationMode.LANDSCAPE_GAME
+            binding.rbOrientPortrait.isChecked -> OrientationMode.PORTRAIT
+            else -> OrientationMode.AUTO_ROTATE
+        }
+
         val codec = if (binding.rbH265.isChecked) {
             VideoCodecType.H265
         } else {
@@ -193,6 +199,7 @@ class MainActivity : AppCompatActivity() {
         return MirrorConfig(
             codec = codec,
             transportMode = transportMode,
+            orientationMode = orientationMode,
             targetHost = targetIp,
             targetPort = 27183,
             maxDimension = maxDim,
