@@ -220,6 +220,7 @@
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
+                    android:checked="true"
                     android:text="60 FPS"
                     android:textColor="@color/text_primary" />
 
@@ -236,7 +237,6 @@
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
-                    android:checked="true"
                     android:text="120 FPS"
                     android:textColor="@color/text_primary" />
             </RadioGroup>

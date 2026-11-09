@@ -207,7 +207,7 @@ class LowLatencyEncoder(
                 setInteger(MediaFormat.KEY_BIT_RATE, clampedBitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, config.intraRefreshSec)
-                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 16_666L)
 
                 if (useExtendedFlags) {
                     setInteger(MediaFormat.KEY_PRIORITY, 0)
@@ -267,11 +267,50 @@ class LowLatencyEncoder(
         var windowBytes = 0L
         var windowEncodeUs = 0L
         var lastStatTimestampMs = System.currentTimeMillis()
+        var idleTimeouts = 0
+        var latestKeyFrameBytes: ByteArray? = null
 
         while (isEncoding.get()) {
             try {
                 val outIndex = mediaCodec.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US)
-                if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                if (outIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                    idleTimeouts++
+                    // Khi màn hình điện thoại đứng yên (static screen trên Android 14/15 Vivo/Xiaomi),
+                    // SurfaceFlinger ngừng đẩy buffer mới. Ta tự động phát lại KeyFrame mỗi ~50ms
+                    // để trình duyệt PC luôn nhận được hình ảnh mượt mà, không bao giờ bị treo 0 FPS!
+                    if (idleTimeouts >= 5) {
+                        idleTimeouts = 0
+                        requestInstantSyncFrame()
+                        val cachedIdr = latestKeyFrameBytes
+                        if (cachedIdr != null) {
+                            val nowUs = System.nanoTime() / 1000L
+                            transport.sendEncodedFrame(
+                                frameType = StreamTransport.FRAME_TYPE_KEYFRAME,
+                                ptsUs = nowUs,
+                                encodeDurationUs = 1200,
+                                data = cachedIdr
+                            )
+                            val total = totalSentFrames.incrementAndGet()
+                            windowFrames++
+                            windowBytes += cachedIdr.size
+                            windowEncodeUs += 1200
+
+                            val nowMs = System.currentTimeMillis()
+                            val elapsedMs = nowMs - lastStatTimestampMs
+                            if (elapsedMs >= 1000L) {
+                                val fps = ((windowFrames * 1000L) / elapsedMs).toInt()
+                                val kbps = (((windowBytes * 8L) / elapsedMs)).toInt()
+                                val avgEnc = if (windowFrames > 0) windowEncodeUs / windowFrames else 0L
+                                onStatsUpdated(fps, kbps, avgEnc, total)
+                                windowFrames = 0
+                                windowBytes = 0L
+                                windowEncodeUs = 0L
+                                lastStatTimestampMs = nowMs
+                            }
+                        }
+                    }
+                } else if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    idleTimeouts = 0
                     extractCsdFromOutputFormat(mediaCodec.outputFormat)?.let { csdBytes ->
                         Log.i(TAG, "Extracted SPS/PPS from INFO_OUTPUT_FORMAT_CHANGED (${csdBytes.size} bytes)")
                         transport.sendEncodedFrame(
@@ -282,6 +321,7 @@ class LowLatencyEncoder(
                         )
                     }
                 } else if (outIndex >= 0) {
+                    idleTimeouts = 0
                     val outputBuffer = mediaCodec.getOutputBuffer(outIndex)
 
                     if (outputBuffer != null && bufferInfo.size > 0) {
@@ -293,6 +333,10 @@ class LowLatencyEncoder(
 
                         val isConfig = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
                         val isKeyFrame = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+
+                        if (isKeyFrame && !isConfig) {
+                            latestKeyFrameBytes = nalBytes.clone()
+                        }
 
                         val frameType = when {
                             isConfig -> StreamTransport.FRAME_TYPE_CONFIG

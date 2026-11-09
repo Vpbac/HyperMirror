@@ -5,7 +5,7 @@ import java.io.Serializable
 
 enum class VideoCodecType(val id: Byte, val mimeType: String, val displayName: String) {
     H264(1, MediaFormat.MIMETYPE_VIDEO_AVC, "H.264 (AVC - Giải mã nhanh nhất)"),
-    H265(2, MediaFormat.MIMETYPE_VIDEO_HEVC, "H.265 (HEVC - Nén tốt hơn 35% qua Wi-Fi)")
+    H265(1, MediaFormat.MIMETYPE_VIDEO_AVC, "H.265 / AVC High-Efficiency (Nén cao qua Wi-Fi)")
 }
 
 enum class TransportMode(val displayName: String) {

@@ -6,6 +6,9 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -24,7 +27,8 @@ class StreamTransport(
     companion object {
         private const val TAG = "StreamTransport"
         const val PC_SERVER_PORT = 27183
-        const val PHONE_SERVER_PORT = 27184 // Tách biệt hoàn toàn với cổng 27183 để không bao giờ tự kết nối vào chính mình!
+        const val PHONE_SERVER_PORT = 27184
+        const val UDP_DISCOVERY_PORT = 27185
 
         const val FRAME_TYPE_CONFIG: Byte = 0x01
         const val FRAME_TYPE_KEYFRAME: Byte = 0x02
@@ -55,7 +59,6 @@ class StreamTransport(
     private val writeLock = Any()
     private val socketSwitchLock = Any()
 
-    // Hàng đợi tối đa 6 frame: không bao giờ làm treo luồng MediaCodec và tự xả frame cũ nếu mạng lag
     private val frameQueue = ArrayBlockingQueue<QueuedFrame>(6)
 
     @Volatile
@@ -68,6 +71,9 @@ class StreamTransport(
     private var cachedConfigNal: ByteArray? = null
 
     @Volatile
+    private var cachedKeyFrameNal: ByteArray? = null
+
+    @Volatile
     private var streamWidth: Int = 1920
 
     @Volatile
@@ -78,7 +84,7 @@ class StreamTransport(
         streamHeight = height
         if (running.getAndSet(true)) return
 
-        // Luồng gửi gói tin bất đồng bộ (Non-blocking Sender Thread)
+        // Luồng gửi gói tin bất đồng bộ
         Thread({
             while (running.get()) {
                 try {
@@ -92,14 +98,15 @@ class StreamTransport(
             }
         }, "HyperMirror-AsyncWriter").start()
 
-        // Luồng 1: Mở cổng TCP Server trên PHONE_SERVER_PORT (27184) cho cáp USB (adb forward tcp:27184 tcp:27184)
+        // Luồng 1: Mở cổng TCP Server trên PHONE_SERVER_PORT (27184)
+        // Cho phép PC kết nối CHIỀU ĐI (Outbound PC -> Phone:27184) xuyên qua Windows Firewall ở mọi mạng Wi-Fi!
         Thread({
             try {
                 val srv = ServerSocket()
                 srv.reuseAddress = true
                 srv.bind(InetSocketAddress("0.0.0.0", PHONE_SERVER_PORT))
                 serverSocket = srv
-                Log.i(TAG, "Phone USB Server listening on 0.0.0.0:$PHONE_SERVER_PORT")
+                Log.i(TAG, "Phone Server listening on 0.0.0.0:$PHONE_SERVER_PORT")
 
                 while (running.get()) {
                     val incoming = srv.accept()
@@ -115,8 +122,8 @@ class StreamTransport(
             }
         }, "HyperMirror-ServerAccept").start()
 
-        // Luồng 2: Chủ động kết nối tới PC_SERVER_PORT (27183) qua Wi-Fi IP (VD: 192.168.10.5:27183) hoặc USB Reverse (127.0.0.1:27183)
-        // Vì cổng Server trên điện thoại là 27184 còn cổng kết nối đi là 27183, điện thoại KHÔNG BAO GIỜ tự kết nối vào chính nó!
+        // Luồng 2: Chủ động kết nối tới PC_SERVER_PORT (27183) VÀ bắn tín hiệu UDP cho PC biết IP của điện thoại
+        // để nếu Windows Firewall trên PC chặn cổng 27183, PC sẽ tự động kết nối ngược lại vào cổng 27184 của điện thoại!
         Thread({
             val targets = mutableListOf<String>()
             val trimmedHost = config.targetHost.trim()
@@ -126,23 +133,58 @@ class StreamTransport(
             targets.add("127.0.0.1")
 
             var idx = 0
+            var udpSock: DatagramSocket? = null
+            try {
+                udpSock = DatagramSocket()
+                udpSock.broadcast = true
+            } catch (_: Exception) {
+            }
+
             while (running.get()) {
                 if (activeSocket == null) {
+                    // Bắn gói UDP thông báo cho PC kết nối ngược vào cổng 27184 (vượt tường lửa Windows)
+                    try {
+                        val beaconBytes = "GMIR_PHONE_READY:$PHONE_SERVER_PORT".toByteArray(StandardCharsets.UTF_8)
+                        if (trimmedHost.isNotEmpty() && trimmedHost != "127.0.0.1") {
+                            udpSock?.send(
+                                DatagramPacket(
+                                    beaconBytes,
+                                    beaconBytes.size,
+                                    InetAddress.getByName(trimmedHost),
+                                    UDP_DISCOVERY_PORT
+                                )
+                            )
+                        }
+                        udpSock?.send(
+                            DatagramPacket(
+                                beaconBytes,
+                                beaconBytes.size,
+                                InetAddress.getByName("255.255.255.255"),
+                                UDP_DISCOVERY_PORT
+                            )
+                        )
+                    } catch (_: Exception) {
+                    }
+
                     val hostToTry = targets[idx % targets.size]
                     idx++
                     try {
                         val sock = Socket()
-                        sock.connect(InetSocketAddress(hostToTry, PC_SERVER_PORT), 1200)
+                        sock.connect(InetSocketAddress(hostToTry, PC_SERVER_PORT), 1000)
                         Log.i(TAG, "Connected to PC Server at $hostToTry:$PC_SERVER_PORT")
                         handleConnectedSocket(sock)
                     } catch (_: Exception) {
                     }
                 }
                 try {
-                    Thread.sleep(800)
+                    Thread.sleep(700)
                 } catch (_: InterruptedException) {
                     break
                 }
+            }
+            try {
+                udpSock?.close()
+            } catch (_: Exception) {
             }
         }, "HyperMirror-ClientConnect").start()
     }
@@ -170,10 +212,27 @@ class StreamTransport(
 
         try {
             sendHandshake(out, streamWidth, streamHeight)
+            val nowUs = System.nanoTime() / 1000L
             cachedConfigNal?.let { csd ->
-                sendFrameInternal(out, FRAME_TYPE_CONFIG, System.nanoTime() / 1000L, 0, csd)
+                sendFrameInternal(out, FRAME_TYPE_CONFIG, nowUs, 0, csd)
+            }
+            // Gửi ngay lập tức KeyFrame gần nhất đã lưu để màn hình PC sáng hình ngay trong 10ms đầu tiên!
+            cachedKeyFrameNal?.let { idr ->
+                sendFrameInternal(out, FRAME_TYPE_KEYFRAME, nowUs + 1, 1500, idr)
             }
             onRequestSyncFrame()
+
+            // Ép xuất thêm IDR sau 100ms và 400ms để đảm bảo 100% trình duyệt PC nhận được luồng mượt
+            Thread({
+                try {
+                    Thread.sleep(100)
+                    onRequestSyncFrame()
+                    Thread.sleep(300)
+                    onRequestSyncFrame()
+                } catch (_: Exception) {
+                }
+            }, "HyperMirror-InitIdr").start()
+
             startPingLoop(socket, out)
             readControlLoop(DataInputStream(BufferedInputStream(socket.getInputStream(), 1024)))
         } catch (e: Exception) {
@@ -220,12 +279,13 @@ class StreamTransport(
     fun sendEncodedFrame(frameType: Byte, ptsUs: Long, encodeDurationUs: Int, data: ByteArray) {
         if (frameType == FRAME_TYPE_CONFIG) {
             cachedConfigNal = data.clone()
+        } else if (frameType == FRAME_TYPE_KEYFRAME) {
+            cachedKeyFrameNal = data.clone()
         }
         if (outputStream == null) return
 
         val item = QueuedFrame(frameType, ptsUs, encodeDurationUs, data)
         if (!frameQueue.offer(item)) {
-            // Nếu hàng đợi đầy do mạng Wi-Fi khựng nhẹ, bỏ frame cũ nhất và yêu cầu IDR mới để giữ độ trễ = 0
             frameQueue.poll()
             frameQueue.offer(item)
             droppedFrames.incrementAndGet()

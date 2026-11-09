@@ -41,15 +41,17 @@
   const viewportContainer = document.getElementById("viewportContainer");
 
   let videoDecoder = null;
-  let configuredCodecString = "";
+  let activeCodecId = 0;
+  let detectedSpsCodecString = "avc1.42e01f";
   let cachedConfigBytes = null;
   let waitingForKeyFrame = true;
   let lastWebCodecsFrameTime = 0;
+  let lastIdrRequestTime = 0;
   let isRenderingBitmap = false;
 
   // Viewport Transform State
-  let cropLandscape16x9 = false; // Cuts top/bottom black bars when phone streams a landscape game inside a portrait frame
-  let rotationDeg = 0; // 0, 90, 180, 270
+  let cropLandscape16x9 = false;
+  let rotationDeg = 0;
   const scaleModes = ["contain", "cover", "fill"];
   const scaleLabels = ["Vừa khít (Z)", "Lấp đầy (Z)", "1920×1080 (Z)"];
   let scaleIndex = 0;
@@ -66,24 +68,24 @@
     if (connectionToast) connectionToast.textContent = msg;
   }
 
-  /**
-   * Central GPU Canvas Renderer supporting:
-   * 1. Auto/Manual 16:9 Center Game Crop (removes top & bottom black bars from portrait stream)
-   * 2. 0° / 90° / 180° / 270° Rotation
-   * 3. 1920x1080 Fullscreen Scaling
-   */
+  function requestIdrThrottled() {
+    const now = performance.now();
+    if (now - lastIdrRequestTime > 600) {
+      lastIdrRequestTime = now;
+      fetch("/api/request-idr", { method: "POST" }).catch(() => {});
+    }
+  }
+
   function drawVideoSourceToCanvas(source, rawW, rawH) {
     let sx = 0;
     let sy = 0;
     let sw = rawW;
     let sh = rawH;
 
-    // If Crop Black Bars 16:9 is active and source is Portrait (e.g. 1080x1920 with horizontal game in middle)
     if (cropLandscape16x9 && rawH > rawW) {
       sh = Math.round((rawW * 9) / 16);
       sy = Math.max(0, Math.round((rawH - sh) / 2));
     } else if (cropLandscape16x9 && rawW > rawH) {
-      // If source is already Landscape but has minor pillarbox/letterbox, crop to 16:9
       const targetH = Math.round((rawW * 9) / 16);
       if (targetH < rawH) {
         sh = targetH;
@@ -92,16 +94,8 @@
     }
 
     const isRotated90 = rotationDeg === 90 || rotationDeg === 270;
-    const outW = cropLandscape16x9
-      ? 1920
-      : isRotated90
-      ? sh
-      : sw;
-    const outH = cropLandscape16x9
-      ? 1080
-      : isRotated90
-      ? sw
-      : sh;
+    const outW = cropLandscape16x9 ? 1920 : isRotated90 ? sh : sw;
+    const outH = cropLandscape16x9 ? 1080 : isRotated90 ? sw : sh;
 
     if (canvas.width !== outW || canvas.height !== outH) {
       canvas.width = outW;
@@ -184,75 +178,80 @@
     }
   });
 
-  function detectH264CodecString(u8) {
-    for (let i = 0; i < u8.length - 7; i++) {
-      let startCodeLen = 0;
+  /**
+   * Parse Annex-B buffer to inspect NAL units:
+   * - Updates `detectedSpsCodecString` ONLY when an actual SPS (NAL type 7) is found
+   * - Checks for SPS/PPS config, IDR KeyFrame slice (NAL 5 / HEVC 19..21), or Non-IDR VCL slice (NAL 1 / HEVC 0..9)
+   */
+  function inspectAnnexBNals(u8, codecId) {
+    let hasConfig = false;
+    let hasIdr = false;
+    let hasSlice = false;
+
+    for (let i = 0; i < u8.length - 4; i++) {
+      let scLen = 0;
       if (u8[i] === 0 && u8[i + 1] === 0 && u8[i + 2] === 1) {
-        startCodeLen = 3;
+        scLen = 3;
       } else if (
         u8[i] === 0 &&
         u8[i + 1] === 0 &&
         u8[i + 2] === 0 &&
         u8[i + 3] === 1
       ) {
-        startCodeLen = 4;
+        scLen = 4;
       }
-      if (startCodeLen > 0) {
-        const nalHeaderIndex = i + startCodeLen;
-        const nalType = u8[nalHeaderIndex] & 0x1f;
-        if (nalType === 7 && nalHeaderIndex + 3 < u8.length) {
-          const profile = u8[nalHeaderIndex + 1]
-            .toString(16)
-            .padStart(2, "0");
-          const compat = u8[nalHeaderIndex + 2]
-            .toString(16)
-            .padStart(2, "0");
-          const level = u8[nalHeaderIndex + 3]
-            .toString(16)
-            .padStart(2, "0");
-          return `avc1.${profile}${compat}${level}`;
-        }
-        i += startCodeLen - 1;
-      }
-    }
-    return "avc1.42e01f";
-  }
+      if (scLen === 0) continue;
 
-  function containsConfigNal(u8, codecId) {
-    for (let i = 0; i < u8.length - 4; i++) {
-      if (
-        u8[i] === 0 &&
-        u8[i + 1] === 0 &&
-        (u8[i + 2] === 1 || (u8[i + 2] === 0 && u8[i + 3] === 1))
-      ) {
-        const offset = u8[i + 2] === 1 ? i + 3 : i + 4;
-        if (offset >= u8.length) break;
-        if (codecId === 2) {
-          const hevcType = (u8[offset] >> 1) & 0x3f;
-          if (hevcType === 32 || hevcType === 33) return true;
-        } else {
-          const avcType = u8[offset] & 0x1f;
-          if (avcType === 7) return true;
+      const hdrIdx = i + scLen;
+      if (hdrIdx >= u8.length) break;
+
+      if (codecId === 2) {
+        // H.265 HEVC NAL unit type
+        const hevcType = (u8[hdrIdx] >> 1) & 0x3f;
+        if (hevcType === 32 || hevcType === 33 || hevcType === 34) {
+          hasConfig = true;
+        } else if (hevcType >= 16 && hevcType <= 21) {
+          hasIdr = true;
+          hasSlice = true;
+        } else if (hevcType >= 0 && hevcType <= 9) {
+          hasSlice = true;
+        }
+      } else {
+        // H.264 AVC NAL unit type
+        const avcType = u8[hdrIdx] & 0x1f;
+        if (avcType === 7) {
+          hasConfig = true;
+          if (hdrIdx + 3 < u8.length) {
+            const profile = u8[hdrIdx + 1].toString(16).padStart(2, "0");
+            const compat = u8[hdrIdx + 2].toString(16).padStart(2, "0");
+            const level = u8[hdrIdx + 3].toString(16).padStart(2, "0");
+            detectedSpsCodecString = `avc1.${profile}${compat}${level}`;
+          }
+        } else if (avcType === 8) {
+          hasConfig = true;
+        } else if (avcType === 5) {
+          hasIdr = true;
+          hasSlice = true;
+        } else if (avcType >= 1 && avcType <= 4) {
+          hasSlice = true;
         }
       }
+      i += scLen - 1;
     }
-    return false;
+
+    return { hasConfig, hasIdr, hasSlice };
   }
 
-  function ensureHardwareDecoder(codecId, sampleBytes) {
+  function ensureHardwareDecoder(codecId) {
     if (!("VideoDecoder" in window)) {
       return false;
     }
 
-    const targetCodec =
-      codecId === 2
-        ? "hev1.1.6.L120.90"
-        : detectH264CodecString(sampleBytes || cachedConfigBytes || new Uint8Array());
-
+    // NEVER close or reset an already-configured working VideoDecoder unless codecId changed or it closed!
     if (
       videoDecoder &&
       videoDecoder.state === "configured" &&
-      configuredCodecString === targetCodec
+      activeCodecId === codecId
     ) {
       return true;
     }
@@ -279,41 +278,51 @@
         emptyOverlay.classList.add("hidden");
         frameCountWindow++;
       },
-      error: () => {
+      error: (err) => {
+        console.warn("[WebCodecs decode error, requesting fresh IDR]", err);
         waitingForKeyFrame = true;
+        requestIdrThrottled();
       },
     });
 
-    try {
-      videoDecoder.configure({
-        codec: targetCodec,
-        optimizeForLatency: true,
-        hardwareAcceleration: "prefer-hardware",
-      });
-      configuredCodecString = targetCodec;
-      waitingForKeyFrame = true;
-      return true;
-    } catch (_) {
-      if (codecId === 2) {
-        // Browser WebCodecs does not support HEVC Annex-B; let Universal FFmpeg decoder render frames
-        return false;
-      }
+    const candidates =
+      codecId === 2
+        ? ["hev1.1.6.L120.90", "hvc1.1.6.L120.90"]
+        : [
+            detectedSpsCodecString,
+            "avc1.64002a",
+            "avc1.4d402a",
+            "avc1.42e01f",
+          ];
+
+    for (const c of candidates) {
       try {
         videoDecoder.configure({
-          codec: "avc1.42e01f",
+          codec: c,
           optimizeForLatency: true,
+          hardwareAcceleration: "prefer-hardware",
         });
-        configuredCodecString = "avc1.42e01f";
+        activeCodecId = codecId;
         waitingForKeyFrame = true;
         return true;
       } catch (_) {
-        return false;
+        try {
+          videoDecoder.configure({
+            codec: c,
+            optimizeForLatency: true,
+          });
+          activeCodecId = codecId;
+          waitingForKeyFrame = true;
+          return true;
+        } catch (_) {}
       }
     }
+
+    return false;
   }
 
   async function renderUniversalJpegFrame(jpegBytes, encodeDurationUs) {
-    if (performance.now() - lastWebCodecsFrameTime < 250) {
+    if (performance.now() - lastWebCodecsFrameTime < 300) {
       return;
     }
     if (isRenderingBitmap) return;
@@ -338,8 +347,8 @@
   function handleBinaryVideoPacket(arrayBuffer) {
     if (arrayBuffer.byteLength <= 14) return;
     const view = new DataView(arrayBuffer);
-    const frameType = view.getUint8(0);
-    const codecId = view.getUint8(1);
+    const frameType = view.getUint8(0); // 1=Config, 2=Keyframe, 3=Normal, 5=Universal JPEG
+    const codecId = view.getUint8(1); // 1=H264, 2=H265
     const ptsUs = Number(view.getBigInt64(2, false));
     const encodeDurationUs = view.getUint32(10, false);
     const payloadBytes = new Uint8Array(arrayBuffer, 14);
@@ -352,23 +361,32 @@
     byteCountWindow += payloadBytes.byteLength;
     encodeUsWindow += encodeDurationUs;
 
-    if (frameType === 1) {
+    const nalInfo = inspectAnnexBNals(payloadBytes, codecId);
+
+    // If packet is pure SPS/PPS config without any VCL video slice, cache it and do NOT call decode()!
+    if (frameType === 1 || (nalInfo.hasConfig && !nalInfo.hasSlice)) {
       cachedConfigBytes = new Uint8Array(payloadBytes);
-      ensureHardwareDecoder(codecId, cachedConfigBytes);
+      ensureHardwareDecoder(codecId);
       return;
     }
 
-    if (!ensureHardwareDecoder(codecId, payloadBytes)) return;
+    // Ignore non-VCL packets (e.g. standalone SEI or AUD) so VideoDecoder never throws
+    if (!nalInfo.hasSlice && frameType !== 2 && frameType !== 3) {
+      return;
+    }
 
-    const isKey = frameType === 2;
+    if (!ensureHardwareDecoder(codecId)) return;
+
+    const isKey = frameType === 2 || nalInfo.hasIdr;
     if (waitingForKeyFrame && !isKey) {
+      requestIdrThrottled();
       return;
     }
 
     let chunkData = payloadBytes;
     if (isKey) {
       waitingForKeyFrame = false;
-      if (cachedConfigBytes && !containsConfigNal(payloadBytes, codecId)) {
+      if (cachedConfigBytes && !nalInfo.hasConfig) {
         const merged = new Uint8Array(
           cachedConfigBytes.byteLength + payloadBytes.byteLength
         );
@@ -392,6 +410,7 @@
       videoDecoder.decode(chunk);
     } catch (_) {
       waitingForKeyFrame = true;
+      requestIdrThrottled();
     }
   }
 
@@ -542,7 +561,6 @@
     setToast("Đã gửi lệnh ép xuất khung hình IDR (KeyFrame) tức thì!");
   });
 
-  // Orientation, Crop, Scale & Fullscreen Buttons
   if (btnCropLandscape) btnCropLandscape.addEventListener("click", toggleCropLandscape);
   if (btnFloatCrop) btnFloatCrop.addEventListener("click", toggleCropLandscape);
 
@@ -561,10 +579,8 @@
     });
   }
 
-  // Double-click anywhere on video viewport to enter/exit True 1920x1080 Fullscreen
   viewportContainer.addEventListener("dblclick", toggleTrueFullscreen);
 
-  // Keyboard shortcuts for gaming: C (Crop 16:9), R (Rotate 90°), Z (Scale), F / F11 (Fullscreen), H (Hide Sidebar)
   window.addEventListener("keydown", (e) => {
     if (e.target && e.target.tagName === "INPUT") return;
     const key = e.key.toLowerCase();

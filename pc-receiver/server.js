@@ -212,10 +212,12 @@ function startUniversalDecoder(codecId = 1) {
   const args = [
     "-fflags", "nobuffer",
     "-flags", "low_delay",
-    "-probesize", "32",
-    "-analyzeduration", "0",
+    "-probesize", "65536",
+    "-analyzeduration", "100000",
     "-f", inputFormat,
     "-i", "pipe:0",
+    "-strict", "-2",
+    "-pix_fmt", "yuvj420p",
     "-f", "image2pipe",
     "-vcodec", "mjpeg",
     "-q:v", "4",
@@ -480,10 +482,25 @@ function connectToPhoneServer(host = "127.0.0.1", port = STREAM_PORT, label = "U
   });
 }
 
-// 3. Automatic Background USB ADB Tunnel + UDP Wi-Fi Auto-Discovery Broadcast
-const udpBeacon = dgram.createSocket("udp4");
-udpBeacon.on("error", () => {});
-udpBeacon.bind(0, () => {
+// 3. Automatic Background USB ADB Tunnel + UDP Wi-Fi Auto-Discovery & Reverse Bypass
+const udpBeacon = dgram.createSocket({ type: "udp4", reuseAddr: true });
+udpBeacon.on("error", (err) => {
+  console.warn(`[UDP Beacon] ${err.message}`);
+});
+
+udpBeacon.on("message", (msg, rinfo) => {
+  const str = msg.toString("utf8").trim();
+  if (str.startsWith("GMIR_PHONE_READY")) {
+    const parts = str.split(":");
+    const phonePort = parts.length > 1 ? Number(parts[1]) : 27184;
+    if (!activePhoneSocket || activePhoneSocket.destroyed) {
+      console.log(`[Auto-Discovery] Phone beacon detected from ${rinfo.address}:${phonePort}, initiating outbound connect...`);
+      connectToPhoneServer(rinfo.address, phonePort, "Wi-Fi Outbound (Firewall Bypass)").catch(() => {});
+    }
+  }
+});
+
+udpBeacon.bind(27185, "0.0.0.0", () => {
   try {
     udpBeacon.setBroadcast(true);
   } catch (_) {}
@@ -830,10 +847,24 @@ const httpServer = http.createServer(async (req, res) => {
       try {
         const { host, port } = JSON.parse(body || "{}");
         const targetHost = host || "127.0.0.1";
-        const targetPort = targetHost === "127.0.0.1" ? 27184 : Number(port || STREAM_PORT);
-        await connectToPhoneServer(targetHost, targetPort, `Direct -> ${targetHost}`);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, message: `Đã kết nối tới ${targetHost}` }));
+        const portsToTry = port ? [Number(port)] : [27184, 27183];
+        let connected = false;
+        let lastErr = null;
+        for (const p of portsToTry) {
+          try {
+            await connectToPhoneServer(targetHost, p, `Direct -> ${targetHost}:${p}`);
+            connected = true;
+            break;
+          } catch (e) {
+            lastErr = e;
+          }
+        }
+        if (connected) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, message: `Đã kết nối thành công tới ${targetHost}!` }));
+        } else {
+          throw lastErr || new Error("Connection failed");
+        }
       } catch (err) {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: false, message: `Đang chờ điện thoại phát luồng (${err.message})` }));
@@ -966,4 +997,8 @@ httpServer.listen(WEB_PORT, "0.0.0.0", () => {
   console.log(`  - LAN Wi-Fi IP(s)   : ${ips} (TCP Port ${STREAM_PORT})`);
   console.log(`  - FFmpeg Engine     : ${FFMPEG_BIN ? "Found" : "WebCodecs GPU Direct Mode"}`);
   console.log(`================================================================`);
+
+  if (process.platform === "win32") {
+    exec(`start "" "http://localhost:${WEB_PORT}"`);
+  }
 });
