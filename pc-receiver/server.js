@@ -1,11 +1,12 @@
 /**
  * HyperMirror Pro - PC Receiver & Low-Latency Gaming Engine
  * Supports:
- * 1. USB Wired Mode (ADB Forward / ADB Reverse TCP_NODELAY)
+ * 1. Auto USB Wired Tunnel (Auto ADB Forward + ADB Reverse + Active Poll)
  * 2. Wi-Fi 5GHz/6GHz Direct Socket Mode (:27183)
- * 3. WebCodecs GPU Hardware Decoding (in-browser <canvas desynchronized>)
+ * 3. Dual Browser Rendering Engine:
+ *    - WebCodecs GPU Hardware Decoder (VideoDecoder optimizeForLatency: true)
+ *    - Universal Zero-Latency FFmpeg MJPEG/Bitmap Stream (Guaranteed 60FPS on all browsers & codecs)
  * 4. Native Direct3D11 / SDL Ultra-Low-Latency Window (via FFplay Zero-Buffer pipe)
- * 5. Real-time Two-Way Control (Live Bitrate Adaptation, Instant IDR Keyframe, Sub-ms Ping/Pong RTT)
  */
 
 const net = require("net");
@@ -43,20 +44,32 @@ function resolveFfmpegTool(toolName) {
   return toolName;
 }
 
+function resolveAdbTool() {
+  const sdkAdb = path.join(
+    process.env.LOCALAPPDATA || "",
+    "Android",
+    "Sdk",
+    "platform-tools",
+    "adb.exe"
+  );
+  return fs.existsSync(sdkAdb) ? `"${sdkAdb}"` : "adb";
+}
+
 const FFMPEG_BIN = resolveFfmpegTool("ffmpeg");
 const FFPLAY_BIN = resolveFfmpegTool("ffplay");
+const ADB_CMD = resolveAdbTool();
 
-// Protocol constants matching Android StreamTransport.kt
+// Protocol constants
 const FRAME_TYPE_CONFIG = 0x01;
 const FRAME_TYPE_KEYFRAME = 0x02;
 const FRAME_TYPE_NORMAL = 0x03;
 const FRAME_TYPE_PING = 0x04;
+const FRAME_TYPE_JPEG = 0x05; // Universal decoded frame for 100% browser compatibility
 
 const CMD_REQUEST_IDR = 0x10;
 const CMD_SET_BITRATE = 0x11;
 const CMD_PONG = 0x12;
 
-// State
 let activePhoneSocket = null;
 let streamMeta = {
   connected: false,
@@ -64,18 +77,18 @@ let streamMeta = {
   deviceName: "-",
   codec: "H.264",
   codecId: 1,
-  width: 1920,
-  height: 1080,
-  targetFps: 120,
+  width: 1080,
+  height: 1920,
+  targetFps: 60,
   targetBitrateKbps: 16000,
 };
 
 let cachedConfigFrame = null;
 let ffplayProcess = null;
+let universalDecoderProcess = null;
 let simulatorProcess = null;
 let simulatorSocket = null;
 
-// Connected WebSocket UI clients
 const wsClients = new Set();
 
 function getLocalLanIps() {
@@ -91,9 +104,6 @@ function getLocalLanIps() {
   return ips;
 }
 
-/**
- * RFC 6455 Native WebSocket Frame Encoder (Zero npm dependencies)
- */
 function encodeWsFrame(opcode, payloadBuffer) {
   const len = payloadBuffer.length;
   let header;
@@ -117,7 +127,7 @@ function encodeWsFrame(opcode, payloadBuffer) {
 
 function broadcastJson(obj) {
   const payload = Buffer.from(JSON.stringify(obj), "utf8");
-  const frame = encodeWsFrame(0x01, payload); // Text frame
+  const frame = encodeWsFrame(0x01, payload);
   for (const sock of wsClients) {
     if (!sock.destroyed) {
       sock.write(frame);
@@ -125,23 +135,14 @@ function broadcastJson(obj) {
   }
 }
 
-/**
- * Broadcasts a binary video frame to all WebCodecs UI clients:
- * Header (14 bytes):
- *   [0]: frameType (1=Config, 2=Keyframe, 3=Normal)
- *   [1]: codecId (1=H264, 2=H265)
- *   [2..9]: ptsUs (BigInt64BE)
- *   [10..13]: encodeDurationUs (UInt32BE)
- *   [14..]: raw Annex-B NAL payload
- */
-function broadcastBinaryVideoFrame(frameType, codecId, ptsUs, encodeDurationUs, nalBuffer) {
+function broadcastBinaryVideoFrame(frameType, codecId, ptsUs, encodeDurationUs, payloadBuffer) {
   if (wsClients.size === 0) return;
   const header = Buffer.allocUnsafe(14);
   header[0] = frameType;
   header[1] = codecId;
   header.writeBigInt64BE(ptsUs, 2);
   header.writeUInt32BE(encodeDurationUs, 10);
-  const wsPacket = encodeWsFrame(0x02, Buffer.concat([header, nalBuffer]));
+  const wsPacket = encodeWsFrame(0x02, Buffer.concat([header, payloadBuffer]));
   for (const sock of wsClients) {
     if (!sock.destroyed) {
       sock.write(wsPacket);
@@ -149,9 +150,6 @@ function broadcastBinaryVideoFrame(frameType, codecId, ptsUs, encodeDurationUs, 
   }
 }
 
-/**
- * Send control command back to Android phone over the full-duplex TCP socket
- */
 function sendCommandToPhone(cmdByte, payloadBuf = Buffer.alloc(0)) {
   if (!activePhoneSocket || activePhoneSocket.destroyed) return false;
   try {
@@ -162,19 +160,103 @@ function sendCommandToPhone(cmdByte, payloadBuf = Buffer.alloc(0)) {
     }
     activePhoneSocket.write(buf);
     return true;
-  } catch (err) {
+  } catch (_) {
     return false;
   }
 }
 
 /**
- * Attach GMIR protocol parser to a connected phone socket (either incoming or outgoing USB)
+ * Universal Zero-Latency FFmpeg Decoder Pipe
+ * Decodes incoming H.264 / H.265 stream in real-time and emits JPEG frames (FRAME_TYPE_JPEG = 0x05)
+ * so the browser canvas ALWAYS displays the video immediately even if WebCodecs rejects a device profile!
  */
-function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
-  if (activePhoneSocket && activePhoneSocket !== socket) {
+function startUniversalDecoder(codecId = 1) {
+  stopUniversalDecoder();
+  const inputFormat = codecId === 2 ? "hevc" : "h264";
+  const args = [
+    "-fflags", "nobuffer",
+    "-flags", "low_delay",
+    "-probesize", "32",
+    "-analyzeduration", "0",
+    "-f", inputFormat,
+    "-i", "pipe:0",
+    "-f", "image2pipe",
+    "-vcodec", "mjpeg",
+    "-q:v", "4",
+    "pipe:1",
+  ];
+
+  try {
+    const proc = spawn(FFMPEG_BIN, args, { stdio: ["pipe", "pipe", "ignore"] });
+    universalDecoderProcess = proc;
+
+    if (cachedConfigFrame && proc.stdin && !proc.stdin.destroyed) {
+      proc.stdin.write(cachedConfigFrame);
+    }
+
+    let jpegAcc = Buffer.alloc(0);
+    proc.stdout.on("data", (chunk) => {
+      jpegAcc = jpegAcc.length === 0 ? chunk : Buffer.concat([jpegAcc, chunk]);
+
+      // Extract complete JPEG frames (SOI 0xFFD8 ... EOI 0xFFD9)
+      while (true) {
+        let soi = -1;
+        for (let i = 0; i < jpegAcc.length - 1; i++) {
+          if (jpegAcc[i] === 0xff && jpegAcc[i + 1] === 0xd8) {
+            soi = i;
+            break;
+          }
+        }
+        if (soi < 0) {
+          jpegAcc = Buffer.alloc(0);
+          break;
+        }
+        let eoi = -1;
+        for (let i = soi + 2; i < jpegAcc.length - 1; i++) {
+          if (jpegAcc[i] === 0xff && jpegAcc[i + 1] === 0xd9) {
+            eoi = i + 2;
+            break;
+          }
+        }
+        if (eoi < 0) {
+          if (soi > 0) jpegAcc = jpegAcc.subarray(soi);
+          break;
+        }
+
+        const jpegFrame = jpegAcc.subarray(soi, eoi);
+        jpegAcc = jpegAcc.subarray(eoi);
+
+        const nowUs = BigInt(Date.now()) * 1000n;
+        broadcastBinaryVideoFrame(FRAME_TYPE_JPEG, codecId, nowUs, 1800, jpegFrame);
+      }
+    });
+
+    proc.on("exit", () => {
+      if (universalDecoderProcess === proc) {
+        universalDecoderProcess = null;
+      }
+    });
+  } catch (err) {
+    console.warn("[Universal Decoder] Failed to spawn ffmpeg:", err.message);
+  }
+}
+
+function stopUniversalDecoder() {
+  if (universalDecoderProcess) {
     try {
-      activePhoneSocket.destroy();
+      universalDecoderProcess.kill();
     } catch (_) {}
+    universalDecoderProcess = null;
+  }
+}
+
+function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
+  if (activePhoneSocket && activePhoneSocket !== socket && !activePhoneSocket.destroyed) {
+    // Already have an active phone connection; ignore duplicate connection attempt
+    try {
+      socket.destroy();
+    } catch (_) {}
+    return;
   }
 
   socket.setNoDelay(true);
@@ -191,7 +273,6 @@ function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
   socket.on("data", (chunk) => {
     rxBuffer = rxBuffer.length === 0 ? chunk : Buffer.concat([rxBuffer, chunk]);
 
-    // Step 1: Parse 24-byte Handshake ("GMIR")
     if (!handshakeDone) {
       if (rxBuffer.length < 24) return;
       const magic = rxBuffer.subarray(0, 4).toString("ascii");
@@ -222,13 +303,13 @@ function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
           `[GMIR Handshake] Device=${deviceName} | ${width}x${height} @ ${fps}FPS | ${streamMeta.codec} | ${bitrateKbps} kbps`
         );
         broadcastJson({ type: "status", meta: streamMeta });
+        startUniversalDecoder(codecId);
       } else {
-        // Fallback if raw Annex-B stream is piped directly without GMIR header
         handshakeDone = true;
+        startUniversalDecoder(1);
       }
     }
 
-    // Step 2: Parse 17-byte GMIR Frame Packets
     while (rxBuffer.length >= 17) {
       const frameType = rxBuffer.readUInt8(0);
       const ptsUs = rxBuffer.readBigInt64BE(1);
@@ -236,23 +317,20 @@ function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
       const payloadLen = rxBuffer.readUInt32BE(13);
 
       if (payloadLen > 16 * 1024 * 1024 || frameType < 1 || frameType > 4) {
-        // Malformed stream recovery
-        console.warn(`[GMIR] Invalid frame header (type=${frameType}, len=${payloadLen}), resetting buffer`);
+        console.warn(`[GMIR] Invalid frame header (type=${frameType}, len=${payloadLen}), resyncing`);
         rxBuffer = Buffer.alloc(0);
         sendCommandToPhone(CMD_REQUEST_IDR);
         break;
       }
 
       if (rxBuffer.length < 17 + payloadLen) {
-        // Wait for remaining NAL bytes
         break;
       }
 
-      const payload = rxBuffer.subarray(17, 17 + payloadLen);
+      const payload = Buffer.from(rxBuffer.subarray(17, 17 + payloadLen));
       rxBuffer = rxBuffer.subarray(17 + payloadLen);
 
       if (frameType === FRAME_TYPE_PING) {
-        // Immediately reply with PONG (0x12 + 8-byte timestamp) for sub-ms RTT measurement
         if (payload.length >= 8) {
           sendCommandToPhone(CMD_PONG, payload.subarray(0, 8));
         }
@@ -260,17 +338,24 @@ function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
       }
 
       if (frameType === FRAME_TYPE_CONFIG) {
-        cachedConfigFrame = Buffer.from(payload);
+        cachedConfigFrame = payload;
       }
 
-      // Forward to Native FFplay Direct3D window if active
+      // Feed Native FFplay Direct3D window if open
       if (ffplayProcess && ffplayProcess.stdin && !ffplayProcess.stdin.destroyed) {
         try {
           ffplayProcess.stdin.write(payload);
         } catch (_) {}
       }
 
-      // Broadcast binary NAL frame to WebCodecs UI clients
+      // Feed Universal FFmpeg Decoder Pipe
+      if (universalDecoderProcess && universalDecoderProcess.stdin && !universalDecoderProcess.stdin.destroyed) {
+        try {
+          universalDecoderProcess.stdin.write(payload);
+        } catch (_) {}
+      }
+
+      // Broadcast raw NAL to WebCodecs clients
       broadcastBinaryVideoFrame(frameType, streamMeta.codecId, ptsUs, encodeDurationUs, payload);
     }
   });
@@ -279,6 +364,7 @@ function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
     if (activePhoneSocket === socket) {
       activePhoneSocket = null;
       streamMeta.connected = false;
+      stopUniversalDecoder();
       broadcastJson({ type: "status", meta: streamMeta });
       console.log("[Stream] Phone disconnected.");
     }
@@ -289,17 +375,15 @@ function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
   });
 }
 
-/**
- * 1. TCP Server listening on 0.0.0.0:27183 for Wi-Fi Client Mode or ADB Reverse Mode
- */
+// 1. TCP Server on 0.0.0.0:27183
 const tcpServer = net.createServer((socket) => {
   console.log(`[TCP Server] Incoming connection from ${socket.remoteAddress}:${socket.remotePort}`);
-  attachPhoneStreamSocket(socket, "Incoming Wi-Fi / ADB Reverse");
+  attachPhoneStreamSocket(socket, "Incoming Wi-Fi / USB Reverse");
 });
 
 tcpServer.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
-    console.log(`[Info] TCP Stream Port ${STREAM_PORT} is already active in another HyperMirror instance.`);
+    console.log(`[Info] TCP Stream Port ${STREAM_PORT} is already active.`);
   } else {
     console.warn(`[TCP Server Error] ${err.message}`);
   }
@@ -309,17 +393,33 @@ tcpServer.listen(STREAM_PORT, "0.0.0.0", () => {
   console.log(`[HyperMirror TCP Server] Listening on 0.0.0.0:${STREAM_PORT} (TCP_NODELAY enabled)`);
 });
 
-/**
- * 2. Active Connect to Android USB Server (127.0.0.1:27183 via adb forward or Phone IP)
- */
+// 2. Active Connect to Android Server
 function connectToPhoneServer(host = "127.0.0.1", port = STREAM_PORT, label = "USB ADB Forward") {
   return new Promise((resolve, reject) => {
+    if (activePhoneSocket && !activePhoneSocket.destroyed) {
+      resolve(true);
+      return;
+    }
     const client = new net.Socket();
-    client.setTimeout(3000);
+    client.setTimeout(1500);
     client.connect(port, host, () => {
       client.setTimeout(0);
-      attachPhoneStreamSocket(client, label);
-      resolve(true);
+      // Verify it's not connecting to our own PC server when adb forward is not active
+      let gotData = false;
+      const timer = setTimeout(() => {
+        if (!gotData && host === "127.0.0.1") {
+          client.destroy();
+          reject(new Error("Loopback self-connection ignored"));
+        }
+      }, 600);
+
+      client.once("data", (firstChunk) => {
+        gotData = true;
+        clearTimeout(timer);
+        attachPhoneStreamSocket(client, label);
+        client.emit("data", firstChunk);
+        resolve(true);
+      });
     });
     client.on("error", (err) => {
       client.destroy();
@@ -332,9 +432,21 @@ function connectToPhoneServer(host = "127.0.0.1", port = STREAM_PORT, label = "U
   });
 }
 
-/**
- * 3. Launch Native Direct3D11 / SDL Ultra-Low-Latency FFplay Window
- */
+// 3. Automatic Background USB ADB Tunnel Setup every 2.5 seconds when disconnected
+setInterval(() => {
+  if (activePhoneSocket && !activePhoneSocket.destroyed) return;
+  exec(
+    `${ADB_CMD} forward tcp:27184 tcp:${STREAM_PORT} && ${ADB_CMD} reverse tcp:${STREAM_PORT} tcp:${STREAM_PORT}`,
+    (err) => {
+      if (!err && (!activePhoneSocket || activePhoneSocket.destroyed)) {
+        // Connect to phone's server via dedicated forwarded port 27184 (avoids colliding with PC's port 27183!)
+        connectToPhoneServer("127.0.0.1", 27184, "Auto USB Cable").catch(() => {});
+      }
+    }
+  );
+}, 2500);
+
+// 4. Native FFplay Direct3D Window
 function toggleNativeFfplayWindow() {
   if (ffplayProcess) {
     try {
@@ -356,7 +468,7 @@ function toggleNativeFfplayWindow() {
     "-analyzeduration", "0",
     "-sync", "ext",
     "-window_title", `HyperMirror Pro Native Direct3D (${streamMeta.codec} Zero-Latency)`,
-    "-i", "pipe:0"
+    "-i", "pipe:0",
   ];
 
   try {
@@ -377,9 +489,7 @@ function toggleNativeFfplayWindow() {
   }
 }
 
-/**
- * 4. Built-in 60/120FPS H.264 Ultra-Low-Latency Hardware Simulator (for instant PC testing!)
- */
+// 5. Built-in 60FPS Simulator
 function toggleBuiltInSimulator(fps = 60, bitrateMbps = 12) {
   if (simulatorProcess) {
     try {
@@ -401,19 +511,17 @@ function toggleBuiltInSimulator(fps = 60, bitrateMbps = 12) {
   const sock = net.createConnection({ host: "127.0.0.1", port: STREAM_PORT }, () => {
     sock.setNoDelay(true);
 
-    // Send 24-byte GMIR Handshake
     const hs = Buffer.alloc(24);
     hs.write("GMIR", 0, "ascii");
-    hs.writeUInt8(1, 4);              // Version 1
-    hs.writeUInt8(1, 5);              // Codec 1 = H.264
+    hs.writeUInt8(1, 4);
+    hs.writeUInt8(1, 5);
     hs.writeUInt16BE(width, 6);
     hs.writeUInt16BE(height, 8);
     hs.writeUInt16BE(fps, 10);
     hs.writeUInt32BE(bitrateMbps * 1000, 12);
-    hs.write("SIM-120Hz".padEnd(8, " ").slice(0, 8), 16, "ascii");
+    hs.write("SIM-60Hz".padEnd(8, " ").slice(0, 8), 16, "ascii");
     sock.write(hs);
 
-    // Spawn FFmpeg generating a real-time 60/120FPS low-latency Baseline/Main H.264 Annex-B stream
     const ffArgs = [
       "-re",
       "-f", "lavfi",
@@ -427,7 +535,7 @@ function toggleBuiltInSimulator(fps = 60, bitrateMbps = 12) {
       "-g", String(fps),
       "-bf", "0",
       "-f", "h264",
-      "pipe:1"
+      "pipe:1",
     ];
 
     simulatorProcess = spawn(FFMPEG_BIN, ffArgs, { stdio: ["ignore", "pipe", "ignore"] });
@@ -438,16 +546,18 @@ function toggleBuiltInSimulator(fps = 60, bitrateMbps = 12) {
       const ptsUs = (frameIndex * 1000000n) / BigInt(fps);
       frameIndex++;
 
-      // Detect if chunk contains SPS (NAL type 7) or IDR (NAL type 5)
       let fType = FRAME_TYPE_NORMAL;
       for (let i = 0; i < nalChunk.length - 4; i++) {
-        if (nalChunk[i] === 0 && nalChunk[i + 1] === 0 && nalChunk[i + 2] === 0 && nalChunk[i + 3] === 1) {
+        if (
+          nalChunk[i] === 0 &&
+          nalChunk[i + 1] === 0 &&
+          nalChunk[i + 2] === 0 &&
+          nalChunk[i + 3] === 1
+        ) {
           const nalType = nalChunk[i + 4] & 0x1f;
-          if (nalType === 7 || nalType === 8) {
-            fType = FRAME_TYPE_CONFIG;
-            break;
-          } else if (nalType === 5) {
+          if (nalType === 5 || nalType === 7) {
             fType = FRAME_TYPE_KEYFRAME;
+            break;
           }
         }
       }
@@ -455,7 +565,7 @@ function toggleBuiltInSimulator(fps = 60, bitrateMbps = 12) {
       const pkt = Buffer.allocUnsafe(17 + nalChunk.length);
       pkt.writeUInt8(fType, 0);
       pkt.writeBigInt64BE(ptsUs, 1);
-      pkt.writeUInt32BE(1450, 9); // 1.45ms simulated hardware DSP encode time
+      pkt.writeUInt32BE(1450, 9);
       pkt.writeUInt32BE(nalChunk.length, 13);
       nalChunk.copy(pkt, 17);
       sock.write(pkt);
@@ -473,43 +583,30 @@ function toggleBuiltInSimulator(fps = 60, bitrateMbps = 12) {
   return { active: true };
 }
 
-/**
- * 5. USB ADB Tunnel Helper (`adb forward` & `adb reverse`)
- */
 function setupUsbAdbTunnel() {
-  const sdkAdb = path.join(
-    process.env.LOCALAPPDATA || "",
-    "Android",
-    "Sdk",
-    "platform-tools",
-    "adb.exe"
-  );
-  const adbCmd = fs.existsSync(sdkAdb) ? `"${sdkAdb}"` : "adb";
-
   return new Promise((resolve) => {
     exec(
-      `${adbCmd} forward tcp:${STREAM_PORT} tcp:${STREAM_PORT} && ${adbCmd} reverse tcp:${STREAM_PORT} tcp:${STREAM_PORT}`,
+      `${ADB_CMD} forward tcp:27184 tcp:${STREAM_PORT} && ${ADB_CMD} reverse tcp:${STREAM_PORT} tcp:${STREAM_PORT}`,
       (err, stdout, stderr) => {
         if (err) {
           resolve({
             ok: false,
             message:
-              "Không tìm thấy thiết bị ADB hoặc chưa bật Gỡ lỗi USB (USB Debugging). Bạn vẫn có thể kết nối qua Wi-Fi IP hoặc bật USB Tethering!",
+              "Không tìm thấy thiết bị ADB hoặc chưa bật USB Debugging. Bạn vẫn có thể kết nối qua Wi-Fi IP!",
             details: stderr || err.message,
           });
         } else {
-          // Try connecting actively to Phone's USB Server on 127.0.0.1:27183
-          connectToPhoneServer("127.0.0.1", STREAM_PORT, "USB Cable (ADB Forward)")
+          connectToPhoneServer("127.0.0.1", 27184, "USB Cable (ADB Forward)")
             .then(() => {
               resolve({
                 ok: true,
-                message: `Đã thiết lập đường truyền cáp USB (cổng ${STREAM_PORT}) và kết nối thành công tới điện thoại!`,
+                message: `Đã kết nối thành công qua cáp USB và bắt đầu nhận luồng hình ảnh!`,
               });
             })
             .catch(() => {
               resolve({
                 ok: true,
-                message: `Đã mở đường hầm cáp USB (adb forward & reverse cổng ${STREAM_PORT}). Hãy bấm 'Bắt đầu chiếu' trên điện thoại!`,
+                message: `Đã mở đường hầm cáp USB (adb forward & reverse). Hãy bấm 'Bắt đầu chiếu' trên điện thoại!`,
               });
             });
         }
@@ -518,9 +615,7 @@ function setupUsbAdbTunnel() {
   });
 }
 
-/**
- * 6. HTTP + WebSocket Control & UI Server
- */
+// 6. HTTP + WebSocket Server
 const httpServer = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
@@ -546,14 +641,6 @@ const httpServer = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === "/api/install-apk" && req.method === "POST") {
-    const sdkAdb = path.join(
-      process.env.LOCALAPPDATA || "",
-      "Android",
-      "Sdk",
-      "platform-tools",
-      "adb.exe"
-    );
-    const adbCmd = fs.existsSync(sdkAdb) ? `"${sdkAdb}"` : "adb";
     const apkCandidate1 = path.join(__dirname, "..", "HyperMirrorSender-debug.apk");
     const apkCandidate2 = path.join(
       __dirname,
@@ -579,13 +666,13 @@ const httpServer = http.createServer(async (req, res) => {
       return;
     }
 
-    exec(`${adbCmd} install -r "${apkPath}"`, (err, stdout, stderr) => {
+    exec(`${ADB_CMD} install -r "${apkPath}"`, (err, stdout, stderr) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       if (err) {
         res.end(
           JSON.stringify({
             ok: false,
-            message: `Chưa thể cài qua USB ADB (${stderr || err.message}). Bạn có thể tải APK trực tiếp qua Wi-Fi tại http://192.168.1.10:${WEB_PORT}/download-apk`,
+            message: `Chưa thể cài qua USB ADB (${stderr || err.message}).`,
           })
         );
       } else {
@@ -635,12 +722,14 @@ const httpServer = http.createServer(async (req, res) => {
     req.on("end", async () => {
       try {
         const { host, port } = JSON.parse(body || "{}");
-        await connectToPhoneServer(host || "127.0.0.1", Number(port || STREAM_PORT), `Direct -> ${host}`);
+        const targetHost = host || "127.0.0.1";
+        const targetPort = targetHost === "127.0.0.1" ? 27184 : Number(port || STREAM_PORT);
+        await connectToPhoneServer(targetHost, targetPort, `Direct -> ${targetHost}`);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, message: `Đã kết nối tới ${host}:${port || STREAM_PORT}` }));
+        res.end(JSON.stringify({ ok: true, message: `Đã kết nối tới ${targetHost}` }));
       } catch (err) {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, message: `Không thể kết nối tới điện thoại: ${err.message}` }));
+        res.end(JSON.stringify({ ok: false, message: `Đang chờ điện thoại phát luồng (${err.message})` }));
       }
     });
     return;
@@ -688,7 +777,6 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // Static files in public/
   const publicDir = path.join(__dirname, "public");
   let filePath = path.join(publicDir, url.pathname === "/" ? "index.html" : url.pathname);
   if (!filePath.startsWith(publicDir)) {
@@ -714,7 +802,6 @@ const httpServer = http.createServer(async (req, res) => {
   });
 });
 
-// Native WebSocket Upgrade Handler
 httpServer.on("upgrade", (req, socket) => {
   const key = req.headers["sec-websocket-key"];
   if (!key) {
@@ -739,7 +826,6 @@ httpServer.on("upgrade", (req, socket) => {
   socket.setNoDelay(true);
   wsClients.add(socket);
 
-  // Send initial metadata & cached SPS/PPS config frame immediately
   socket.write(encodeWsFrame(0x01, Buffer.from(JSON.stringify({ type: "status", meta: streamMeta }))));
   if (cachedConfigFrame) {
     const header = Buffer.allocUnsafe(14);

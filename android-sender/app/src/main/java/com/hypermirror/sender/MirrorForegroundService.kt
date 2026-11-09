@@ -14,9 +14,12 @@ import android.media.projection.MediaProjectionManager
 import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.util.DisplayMetrics
+import android.util.Log
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -25,6 +28,7 @@ import kotlinx.coroutines.flow.StateFlow
 class MirrorForegroundService : Service() {
 
     companion object {
+        private const val TAG = "MirrorForegroundService"
         const val ACTION_START = "com.hypermirror.sender.ACTION_START"
         const val ACTION_STOP = "com.hypermirror.sender.ACTION_STOP"
         const val EXTRA_RESULT_CODE = "extra_result_code"
@@ -71,91 +75,114 @@ class MirrorForegroundService : Service() {
                     (intent.getSerializableExtra(EXTRA_CONFIG) as? MirrorConfig) ?: MirrorConfig()
                 }
 
-                if (resultData != null) {
-                    startMirrorSession(resultCode, resultData, config)
+                if (resultData != null && resultCode == Activity.RESULT_OK) {
+                    startMirrorSessionSafely(resultCode, resultData, config)
+                } else {
+                    stopSelf()
                 }
             }
             ACTION_STOP -> {
                 stopMirrorSession()
                 stopSelf()
             }
+            else -> {
+                stopSelf()
+            }
         }
         return START_NOT_STICKY
     }
 
-    private fun startMirrorSession(resultCode: Int, resultData: Intent, config: MirrorConfig) {
-        stopMirrorSession()
-        createNotificationChannel()
-        val notification = buildNotification(config)
+    private fun startMirrorSessionSafely(resultCode: Int, resultData: Intent, config: MirrorConfig) {
+        try {
+            stopMirrorSession()
+            createNotificationChannel()
+            val notification = buildNotification(config)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+
+            acquireLowLatencyLocks()
+
+            val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val projection = projectionManager.getMediaProjection(resultCode, resultData)
+            if (projection == null) {
+                Log.e(TAG, "MediaProjection returned null")
+                stopMirrorSession()
+                stopSelf()
+                return
+            }
+
+            projection.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    stopMirrorSession()
+                    stopSelf()
+                }
+            }, Handler(Looper.getMainLooper()))
+            mediaProjection = projection
+
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(metrics)
+
+            var currentClientAddr = "-"
+            var isConnected = false
+
+            val streamTransport = StreamTransport(
+                config = config,
+                onRequestSyncFrame = { encoder?.requestInstantSyncFrame() },
+                onDynamicBitrateChange = { newBps -> encoder?.updateDynamicBitrate(newBps) },
+                onConnectionStateChanged = { connected, addr ->
+                    isConnected = connected
+                    currentClientAddr = addr
+                    _telemetryFlow.value = _telemetryFlow.value.copy(
+                        connected = connected,
+                        clientAddress = addr
+                    )
+                }
             )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
+            transport = streamTransport
 
-        acquireLowLatencyLocks()
+            val hwEncoder = LowLatencyEncoder(
+                mediaProjection = projection,
+                displayMetrics = metrics,
+                config = config,
+                transport = streamTransport,
+                onStatsUpdated = { fps, bitrateKbps, avgEncodeUs, totalFrames ->
+                    _telemetryFlow.value = StreamTelemetry(
+                        connected = isConnected,
+                        clientAddress = currentClientAddr,
+                        currentFps = fps,
+                        currentBitrateKbps = bitrateKbps,
+                        avgEncodeTimeUs = avgEncodeUs,
+                        rttLatencyMs = streamTransport.latestRttMs,
+                        sentFrames = totalFrames,
+                        droppedFrames = streamTransport.droppedFrames.get()
+                    )
+                }
+            )
+            encoder = hwEncoder
 
-        val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val projection = projectionManager.getMediaProjection(resultCode, resultData)
-        projection.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() {
+            if (hwEncoder.start()) {
+                streamTransport.start(hwEncoder.encodedWidth, hwEncoder.encodedHeight)
+                _isRunningFlow.value = true
+            } else {
+                Log.e(TAG, "Hardware encoder failed all configuration tiers")
                 stopMirrorSession()
                 stopSelf()
             }
-        }, null)
-        mediaProjection = projection
-
-        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        val metrics = DisplayMetrics()
-        @Suppress("DEPRECATION")
-        wm.defaultDisplay.getRealMetrics(metrics)
-
-        var currentClientAddr = "-"
-        var isConnected = false
-
-        val streamTransport = StreamTransport(
-            config = config,
-            onRequestSyncFrame = { encoder?.requestInstantSyncFrame() },
-            onDynamicBitrateChange = { newBps -> encoder?.updateDynamicBitrate(newBps) },
-            onConnectionStateChanged = { connected, addr ->
-                isConnected = connected
-                currentClientAddr = addr
-                _telemetryFlow.value = _telemetryFlow.value.copy(
-                    connected = connected,
-                    clientAddress = addr
-                )
-            }
-        )
-        transport = streamTransport
-
-        val hwEncoder = LowLatencyEncoder(
-            mediaProjection = projection,
-            displayMetrics = metrics,
-            config = config,
-            transport = streamTransport,
-            onStatsUpdated = { fps, bitrateKbps, avgEncodeUs, totalFrames ->
-                _telemetryFlow.value = StreamTelemetry(
-                    connected = isConnected,
-                    clientAddress = currentClientAddr,
-                    currentFps = fps,
-                    currentBitrateKbps = bitrateKbps,
-                    avgEncodeTimeUs = avgEncodeUs,
-                    rttLatencyMs = streamTransport.latestRttMs,
-                    sentFrames = totalFrames,
-                    droppedFrames = streamTransport.droppedFrames.get()
-                )
-            }
-        )
-        encoder = hwEncoder
-
-        streamTransport.start(hwEncoder.encodedWidth, hwEncoder.encodedHeight)
-        hwEncoder.start()
-        _isRunningFlow.value = true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting mirror session", e)
+            stopMirrorSession()
+            stopSelf()
+        }
     }
 
     fun updateLiveBitrateMbps(mbps: Int) {
@@ -171,12 +198,11 @@ class MirrorForegroundService : Service() {
             val pm = applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HyperMirror::GamingEncodeWakeLock").apply {
                 setReferenceCounted(false)
-                acquire(4 * 60 * 60 * 1000L) // Tối đa 4 giờ chơi game liên tục
+                acquire(4 * 60 * 60 * 1000L)
             }
 
             val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
             val wifiLockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Chế độ giảm tối đa độ trễ radio Wi-Fi trên Android 10+ (tắt Power Save DTIM)
                 WifiManager.WIFI_MODE_FULL_LOW_LATENCY
             } else {
                 @Suppress("DEPRECATION")
@@ -206,9 +232,15 @@ class MirrorForegroundService : Service() {
 
     fun stopMirrorSession() {
         _isRunningFlow.value = false
-        encoder?.stop()
+        try {
+            encoder?.stop()
+        } catch (_: Exception) {
+        }
         encoder = null
-        transport?.stop()
+        try {
+            transport?.stop()
+        } catch (_: Exception) {
+        }
         transport = null
         try {
             mediaProjection?.stop()

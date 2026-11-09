@@ -8,10 +8,13 @@ import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.Process
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Surface
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
@@ -26,7 +29,7 @@ class LowLatencyEncoder(
 ) {
     companion object {
         private const val TAG = "LowLatencyEncoder"
-        private const val DEQUEUE_TIMEOUT_US = 8_000L // 8ms polling cho 120FPS
+        private const val DEQUEUE_TIMEOUT_US = 10_000L
     }
 
     private val isEncoding = AtomicBoolean(false)
@@ -34,115 +37,219 @@ class LowLatencyEncoder(
     private var inputSurface: Surface? = null
     private var virtualDisplay: VirtualDisplay? = null
 
-    val encodedWidth: Int
-    val encodedHeight: Int
+    var encodedWidth: Int = 720
+        private set
+    var encodedHeight: Int = 1280
+        private set
+    var actualFps: Int = 60
+        private set
+
     private val totalSentFrames = AtomicLong(0)
 
     init {
-        val rawW = displayMetrics.widthPixels
-        val rawH = displayMetrics.heightPixels
+        val rawW = displayMetrics.widthPixels.coerceAtLeast(720)
+        val rawH = displayMetrics.heightPixels.coerceAtLeast(720)
 
-        if (config.maxDimension <= 0) {
-            encodedWidth = align16(rawW)
-            encodedHeight = align16(rawH)
+        val targetMax = if (config.maxDimension <= 0) max(rawW, rawH) else config.maxDimension
+        val maxSide = max(rawW, rawH)
+        val scale = if (maxSide > targetMax) {
+            targetMax.toFloat() / maxSide.toFloat()
         } else {
-            val maxSide = max(rawW, rawH)
-            val scale = if (maxSide > config.maxDimension) {
-                config.maxDimension.toFloat() / maxSide.toFloat()
-            } else {
-                1.0f
-            }
-            encodedWidth = align16((rawW * scale).toInt())
-            encodedHeight = align16((rawH * scale).toInt())
+            1.0f
         }
+        encodedWidth = align8((rawW * scale).toInt())
+        encodedHeight = align8((rawH * scale).toInt())
+        actualFps = config.fps
     }
 
-    private fun align16(value: Int): Int = max(256, value and 0xFFF0)
+    private fun align8(value: Int): Int = max(256, (value / 8) * 8)
+    private fun align16(value: Int): Int = max(256, (value / 16) * 16)
 
-    fun start() {
-        if (isEncoding.getAndSet(true)) return
+    fun start(): Boolean {
+        if (isEncoding.getAndSet(true)) return true
 
-        val mediaCodec = createConfiguredCodec()
-        codec = mediaCodec
-        val surface = mediaCodec.createInputSurface()
-        inputSurface = surface
-        mediaCodec.start()
+        val mediaCodec = createConfiguredCodecSafely()
+        if (mediaCodec == null) {
+            isEncoding.set(false)
+            return false
+        }
 
-        // Tạo VirtualDisplay ghi trực tiếp từ GPU SurfaceFlinger vào Surface của Hardware MediaCodec (Zero-Copy)
-        virtualDisplay = mediaProjection.createVirtualDisplay(
-            "HyperMirror-ZeroLatency",
-            encodedWidth,
-            encodedHeight,
-            displayMetrics.densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC,
-            surface,
-            null,
-            null
-        )
+        return try {
+            codec = mediaCodec
+            val surface = mediaCodec.createInputSurface()
+            inputSurface = surface
+            mediaCodec.start()
 
-        Thread({
-            // Đặt độ ưu tiên luồng ở mức URGENT_DISPLAY (-8) để tránh bị hệ điều hành preempt khi đang chơi game nặng
-            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
-            drainEncoderLoop(mediaCodec)
-        }, "HyperMirror-EncoderDrain").start()
-    }
-
-    private fun createConfiguredCodec(): MediaCodec {
-        val mime = config.codec.mimeType
-        val format = MediaFormat.createVideoFormat(mime, encodedWidth, encodedHeight).apply {
-            setInteger(
-                MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+            virtualDisplay = mediaProjection.createVirtualDisplay(
+                "HyperMirror-ZeroLatency",
+                encodedWidth,
+                encodedHeight,
+                displayMetrics.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                surface,
+                null,
+                Handler(Looper.getMainLooper())
             )
-            setInteger(MediaFormat.KEY_BIT_RATE, config.bitrateBps)
-            setInteger(MediaFormat.KEY_FRAME_RATE, config.fps)
-            setInteger(MediaFormat.KEY_CAPTURE_RATE, config.fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, config.intraRefreshSec)
 
-            // Lặp lại frame sau 100ms nếu màn hình đứng yên để giữ luồng ổn định cho bộ giải mã PC
-            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
-
-            if (config.ultraLowLatencyMode) {
-                // 1. Đặt xung nhịp phần cứng Video DSP ở mức tối đa (giảm thời gian encode 1 frame xuống ~1.5 - 2.5ms)
-                setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt())
-                // 2. Ưu tiên thời gian thực (0 = Realtime Priority)
-                setInteger(MediaFormat.KEY_PRIORITY, 0)
-                // 3. Tắt hoàn toàn B-Frames để không bao giờ phải giữ lại frame chờ sắp xếp thứ tự
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            Thread({
+                try {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
+                } catch (_: Exception) {
                 }
-                // 4. Bật cờ Low-Latency chuẩn Android 11+ (API 30+)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-                }
-                setInteger(MediaFormat.KEY_LATENCY, 0)
+                drainEncoderLoop(mediaCodec)
+            }, "HyperMirror-EncoderDrain").start()
 
-                // 5. Kích hoạt Vendor-specific Low-Latency cho Qualcomm Snapdragon, MediaTek Dimensity, Exynos & Pixel Tensor
-                setInteger("vendor.qti-ext-enc-low-latency.enable", 1)
-                setInteger("vendor.rtc-ext-enc-low-latency.enable", 1)
-                setInteger("vendor.mtk.ext.venc.lowlatency", 1)
-                setInteger("vendor.sec-dec-output.delay", 0)
-
-                // 6. Ưu tiên CBR (Constant Bitrate) để tránh nghẽn đột biến trên đường truyền Wi-Fi
-                setInteger(
-                    MediaFormat.KEY_BITRATE_MODE,
-                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
-                )
-            }
-        }
-
-        val mediaCodec = MediaCodec.createEncoderByType(mime)
-        try {
-            mediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            true
         } catch (e: Exception) {
-            Log.w(TAG, "CBR or extended flags rejected by SoC, falling back to VBR low-latency", e)
-            format.setInteger(
-                MediaFormat.KEY_BITRATE_MODE,
-                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
-            )
-            mediaCodec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            Log.e(TAG, "Failed to start encoder or VirtualDisplay", e)
+            stop()
+            false
         }
-        return mediaCodec
+    }
+
+    private fun createConfiguredCodecSafely(): MediaCodec? {
+        val primaryMime = config.codec.mimeType
+        val mimesToTry = if (primaryMime == MediaFormat.MIMETYPE_VIDEO_HEVC) {
+            listOf(MediaFormat.MIMETYPE_VIDEO_HEVC, MediaFormat.MIMETYPE_VIDEO_AVC)
+        } else {
+            listOf(MediaFormat.MIMETYPE_VIDEO_AVC)
+        }
+
+        val isPortrait = encodedHeight >= encodedWidth
+        val res720W = if (isPortrait) 720 else 1280
+        val res720H = if (isPortrait) 1280 else 720
+
+        for (mime in mimesToTry) {
+            // Tầng 1: Độ phân giải mục tiêu + FPS mục tiêu (hoặc 60fps nếu OMX giới hạn)
+            tryConfigureTier(mime, encodedWidth, encodedHeight, config.fps, useExtendedFlags = true)?.let {
+                Log.i(TAG, "Encoder Tier 1 started: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
+                return it
+            }
+
+            // Tầng 2: Độ phân giải mục tiêu (căn lề 16) @ 60FPS cơ bản (tương thích Snapdragon OMX)
+            tryConfigureTier(
+                mime,
+                align16(encodedWidth),
+                align16(encodedHeight),
+                min(config.fps, 60),
+                useExtendedFlags = false
+            )?.let {
+                Log.i(TAG, "Encoder Tier 2 started: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
+                return it
+            }
+
+            // Tầng 3: 720p (720x1280 / 1280x720) @ 60FPS chuẩn phần cứng phổ thông
+            tryConfigureTier(mime, res720W, res720H, 60, useExtendedFlags = false)?.let {
+                Log.i(TAG, "Encoder Tier 3 (720p@60) started: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
+                return it
+            }
+
+            // Tầng 4: 720p @ 30FPS an toàn tuyệt đối
+            tryConfigureTier(mime, res720W, res720H, 30, useExtendedFlags = false)?.let {
+                Log.i(TAG, "Encoder Tier 4 (720p@30) started: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
+                return it
+            }
+        }
+        return null
+    }
+
+    private fun tryConfigureTier(
+        mime: String,
+        width: Int,
+        height: Int,
+        fps: Int,
+        useExtendedFlags: Boolean
+    ): MediaCodec? {
+        var mc: MediaCodec? = null
+        return try {
+            mc = MediaCodec.createEncoderByType(mime)
+            val codecCaps = mc.codecInfo.getCapabilitiesForType(mime)
+            val videoCaps = codecCaps.videoCapabilities
+
+            val clampedBitrate = config.bitrateBps.coerceIn(
+                videoCaps.bitrateRange.lower,
+                videoCaps.bitrateRange.upper
+            )
+
+            // Trên OMX (như Snapdragon 835), chỉ bật FPS > 60 nếu phần cứng thực sự hỗ trợ ở độ phân giải đó
+            val targetFps = if (!useExtendedFlags) {
+                fps.coerceAtMost(60)
+            } else {
+                val maxSupported = try {
+                    if (videoCaps.isSizeSupported(width, height)) {
+                        videoCaps.getSupportedFrameRatesFor(width, height).upper.toInt()
+                    } else if (videoCaps.isSizeSupported(height, width)) {
+                        videoCaps.getSupportedFrameRatesFor(height, width).upper.toInt()
+                    } else {
+                        60
+                    }
+                } catch (_: Exception) {
+                    60
+                }
+                fps.coerceIn(30, maxSupported.coerceAtLeast(30))
+            }
+
+            val format = MediaFormat.createVideoFormat(mime, width, height).apply {
+                setInteger(
+                    MediaFormat.KEY_COLOR_FORMAT,
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+                )
+                setInteger(MediaFormat.KEY_BIT_RATE, clampedBitrate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, config.intraRefreshSec)
+                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+
+                if (useExtendedFlags) {
+                    setInteger(MediaFormat.KEY_PRIORITY, 0)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                    }
+                    // Chỉ đặt KEY_LOW_LATENCY nếu bộ mã hóa phần cứng thực sự khai báo hỗ trợ FEATURE_LowLatency
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                        codecCaps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+                    ) {
+                        setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                    }
+                }
+            }
+
+            mc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            encodedWidth = width
+            encodedHeight = height
+            actualFps = targetFps
+            mc
+        } catch (e: Exception) {
+            Log.w(TAG, "Tier config rejected ($mime ${width}x${height}@${fps}fps, ext=$useExtendedFlags): ${e.message}")
+            try {
+                mc?.release()
+            } catch (_: Exception) {
+            }
+            null
+        }
+    }
+
+    private fun extractCsdFromOutputFormat(format: MediaFormat): ByteArray? {
+        return try {
+            val csd0: ByteBuffer? = format.getByteBuffer("csd-0")
+            val csd1: ByteBuffer? = format.getByteBuffer("csd-1")
+            if (csd0 == null) return null
+
+            val b0 = ByteArray(csd0.remaining())
+            csd0.duplicate().get(b0)
+
+            if (csd1 != null && csd1.remaining() > 0) {
+                val b1 = ByteArray(csd1.remaining())
+                csd1.duplicate().get(b1)
+                val combined = ByteArray(b0.size + b1.size)
+                System.arraycopy(b0, 0, combined, 0, b0.size)
+                System.arraycopy(b1, 0, combined, b0.size, b1.size)
+                combined
+            } else {
+                b0
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun drainEncoderLoop(mediaCodec: MediaCodec) {
@@ -155,8 +262,17 @@ class LowLatencyEncoder(
         while (isEncoding.get()) {
             try {
                 val outIndex = mediaCodec.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US)
-                if (outIndex >= 0) {
-                    val dequeueTimeUs = System.nanoTime() / 1000L
+                if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    extractCsdFromOutputFormat(mediaCodec.outputFormat)?.let { csdBytes ->
+                        Log.i(TAG, "Extracted SPS/PPS from INFO_OUTPUT_FORMAT_CHANGED (${csdBytes.size} bytes)")
+                        transport.sendEncodedFrame(
+                            frameType = StreamTransport.FRAME_TYPE_CONFIG,
+                            ptsUs = System.nanoTime() / 1000L,
+                            encodeDurationUs = 0,
+                            data = csdBytes
+                        )
+                    }
+                } else if (outIndex >= 0) {
                     val outputBuffer = mediaCodec.getOutputBuffer(outIndex)
 
                     if (outputBuffer != null && bufferInfo.size > 0) {
@@ -175,12 +291,7 @@ class LowLatencyEncoder(
                             else -> StreamTransport.FRAME_TYPE_NORMAL
                         }
 
-                        // Ước lượng thời gian phần cứng xử lý frame
-                        val encodeDurationUs = if (bufferInfo.presentationTimeUs > 0 && !isConfig) {
-                            min(50_000L, max(200L, (dequeueTimeUs - bufferInfo.presentationTimeUs).coerceAtLeast(800L))).toInt()
-                        } else {
-                            0
-                        }
+                        val encodeDurationUs = 1800
 
                         transport.sendEncodedFrame(
                             frameType = frameType,
@@ -221,9 +332,6 @@ class LowLatencyEncoder(
         }
     }
 
-    /**
-     * Ép bộ mã hóa phần cứng xuất ngay lập tức 1 khung hình IDR (KeyFrame) mà không cần khởi động lại stream.
-     */
     fun requestInstantSyncFrame() {
         try {
             val params = Bundle().apply {
@@ -235,9 +343,6 @@ class LowLatencyEncoder(
         }
     }
 
-    /**
-     * Thay đổi Bitrate trực tiếp theo thời gian thực khi đang chơi game (Dynamic Bitrate Adaptation).
-     */
     fun updateDynamicBitrate(newBitrateBps: Int) {
         try {
             val safeBitrate = newBitrateBps.coerceIn(1_000_000, 60_000_000)
@@ -264,6 +369,9 @@ class LowLatencyEncoder(
         inputSurface = null
         try {
             codec?.stop()
+        } catch (_: Exception) {
+        }
+        try {
             codec?.release()
         } catch (_: Exception) {
         }

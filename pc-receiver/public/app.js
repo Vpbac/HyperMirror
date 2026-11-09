@@ -1,6 +1,5 @@
 (() => {
   const canvas = document.getElementById("mirrorCanvas");
-  // desynchronized: true bypasses compositor VSync queue for ultra-low gaming latency
   const ctx =
     canvas.getContext("2d", { alpha: false, desynchronized: true }) ||
     canvas.getContext("2d");
@@ -35,6 +34,8 @@
   let configuredCodecString = "";
   let cachedConfigBytes = null;
   let waitingForKeyFrame = true;
+  let lastWebCodecsFrameTime = 0;
+  let isRenderingBitmap = false;
 
   // Telemetry accumulators
   let frameCountWindow = 0;
@@ -48,9 +49,6 @@
     connectionToast.textContent = msg;
   }
 
-  /**
-   * Scan Annex-B buffer for H.264 SPS (NAL type 7) to build exact avc1.PPCCLL codec string
-   */
   function detectH264CodecString(u8) {
     for (let i = 0; i < u8.length - 7; i++) {
       let startCodeLen = 0;
@@ -85,9 +83,6 @@
     return "avc1.42e01f";
   }
 
-  /**
-   * Check if Annex-B buffer already contains SPS (NAL type 7 for H.264 or 32/33 for H.265)
-   */
   function containsConfigNal(u8, codecId) {
     for (let i = 0; i < u8.length - 4; i++) {
       if (
@@ -111,9 +106,6 @@
 
   function ensureHardwareDecoder(codecId, sampleBytes) {
     if (!("VideoDecoder" in window)) {
-      setToast(
-        "Trình duyệt không hỗ trợ WebCodecs API. Hãy bấm 'Mở cửa sổ Native Direct3D (FFplay)'!"
-      );
       return false;
     }
 
@@ -138,9 +130,11 @@
 
     videoDecoder = new VideoDecoder({
       output: (frame) => {
+        const now = performance.now();
+        lastWebCodecsFrameTime = now;
         const startT = pendingDecodeTimestamps.get(frame.timestamp);
         if (startT !== undefined) {
-          decodeMsWindow += performance.now() - startT;
+          decodeMsWindow += now - startT;
           pendingDecodeTimestamps.delete(frame.timestamp);
         }
 
@@ -158,8 +152,7 @@
         emptyOverlay.classList.add("hidden");
         frameCountWindow++;
       },
-      error: (err) => {
-        console.warn("[WebCodecs Decoder Error]", err);
+      error: () => {
         waitingForKeyFrame = true;
       },
     });
@@ -173,7 +166,7 @@
       configuredCodecString = targetCodec;
       waitingForKeyFrame = true;
       return true;
-    } catch (e) {
+    } catch (_) {
       try {
         videoDecoder.configure({
           codec: "avc1.42e01f",
@@ -182,48 +175,79 @@
         configuredCodecString = "avc1.42e01f";
         waitingForKeyFrame = true;
         return true;
-      } catch (err2) {
-        console.error("Failed to configure VideoDecoder:", err2);
+      } catch (_) {
         return false;
       }
+    }
+  }
+
+  async function renderUniversalJpegFrame(jpegBytes, encodeDurationUs) {
+    // Only render universal decoded frame if WebCodecs hasn't rendered within the last 250ms
+    if (performance.now() - lastWebCodecsFrameTime < 250) {
+      return;
+    }
+    if (isRenderingBitmap) return;
+    isRenderingBitmap = true;
+    const t0 = performance.now();
+    try {
+      const blob = new Blob([jpegBytes], { type: "image/jpeg" });
+      const bmp = await createImageBitmap(blob);
+      if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
+        canvas.width = bmp.width;
+        canvas.height = bmp.height;
+      }
+      ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+      bmp.close();
+
+      emptyOverlay.classList.add("hidden");
+      frameCountWindow++;
+      encodeUsWindow += encodeDurationUs;
+      decodeMsWindow += performance.now() - t0;
+    } catch (_) {
+    } finally {
+      isRenderingBitmap = false;
     }
   }
 
   function handleBinaryVideoPacket(arrayBuffer) {
     if (arrayBuffer.byteLength <= 14) return;
     const view = new DataView(arrayBuffer);
-    const frameType = view.getUint8(0); // 1=Config, 2=Keyframe, 3=Normal
+    const frameType = view.getUint8(0); // 1=Config, 2=Keyframe, 3=Normal, 5=Universal JPEG
     const codecId = view.getUint8(1); // 1=H264, 2=H265
     const ptsUs = Number(view.getBigInt64(2, false));
     const encodeDurationUs = view.getUint32(10, false);
-    const nalBytes = new Uint8Array(arrayBuffer, 14);
+    const payloadBytes = new Uint8Array(arrayBuffer, 14);
 
-    byteCountWindow += nalBytes.byteLength;
+    if (frameType === 5) {
+      renderUniversalJpegFrame(payloadBytes, encodeDurationUs);
+      return;
+    }
+
+    byteCountWindow += payloadBytes.byteLength;
     encodeUsWindow += encodeDurationUs;
 
     if (frameType === 1) {
-      // Cache SPS/PPS/VPS config packet
-      cachedConfigBytes = new Uint8Array(nalBytes);
+      cachedConfigBytes = new Uint8Array(payloadBytes);
       ensureHardwareDecoder(codecId, cachedConfigBytes);
       return;
     }
 
-    if (!ensureHardwareDecoder(codecId, nalBytes)) return;
+    if (!ensureHardwareDecoder(codecId, payloadBytes)) return;
 
     const isKey = frameType === 2;
     if (waitingForKeyFrame && !isKey) {
       return;
     }
 
-    let chunkData = nalBytes;
+    let chunkData = payloadBytes;
     if (isKey) {
       waitingForKeyFrame = false;
-      if (cachedConfigBytes && !containsConfigNal(nalBytes, codecId)) {
+      if (cachedConfigBytes && !containsConfigNal(payloadBytes, codecId)) {
         const merged = new Uint8Array(
-          cachedConfigBytes.byteLength + nalBytes.byteLength
+          cachedConfigBytes.byteLength + payloadBytes.byteLength
         );
         merged.set(cachedConfigBytes, 0);
-        merged.set(nalBytes, cachedConfigBytes.byteLength);
+        merged.set(payloadBytes, cachedConfigBytes.byteLength);
         chunkData = merged;
       }
     }
@@ -240,7 +264,7 @@
         data: chunkData,
       });
       videoDecoder.decode(chunk);
-    } catch (err) {
+    } catch (_) {
       waitingForKeyFrame = true;
     }
   }
@@ -256,7 +280,6 @@
     hudCodec.textContent = `${meta.codec || "H.264"} • ${meta.width}×${meta.height} @ ${meta.targetFps}Hz`;
   }
 
-  // Periodic Telemetry HUD Refresh
   setInterval(() => {
     const now = performance.now();
     const elapsedSec = (now - lastStatTime) / 1000;
@@ -285,7 +308,6 @@
     lastStatTime = now;
   }, 500);
 
-  // Connect WebSocket
   function connectWebSocket() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}`);
@@ -318,7 +340,6 @@
     };
   }
 
-  // Load initial server info
   async function loadServerInfo() {
     try {
       const res = await fetch("/api/info");
@@ -335,7 +356,6 @@
     } catch (_) {}
   }
 
-  // Event Listeners
   btnUsbAdb.addEventListener("click", async () => {
     setToast("Đang thiết lập đường truyền cáp USB (ADB Forward/Reverse)...");
     const res = await fetch("/api/usb-adb", { method: "POST" });
@@ -354,7 +374,7 @@
 
   btnConnectPhone.addEventListener("click", async () => {
     const host = inputPhoneIp.value.trim() || "127.0.0.1";
-    setToast(`Đang kết nối tới ${host}:27183...`);
+    setToast(`Đang kết nối tới ${host}...`);
     const res = await fetch("/api/connect-phone", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
