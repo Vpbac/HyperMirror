@@ -19,6 +19,33 @@ const { spawn, exec } = require("child_process");
 const STREAM_PORT = Number(process.env.STREAM_PORT || 27183);
 const WEB_PORT = Number(process.env.WEB_PORT || 3080);
 
+function resolveFfmpegTool(toolName) {
+  const exeName = process.platform === "win32" ? `${toolName}.exe` : toolName;
+  const wingetBase = path.join(
+    process.env.LOCALAPPDATA || "",
+    "Microsoft",
+    "WinGet",
+    "Packages"
+  );
+  try {
+    if (fs.existsSync(wingetBase)) {
+      for (const pkg of fs.readdirSync(wingetBase)) {
+        if (pkg.toLowerCase().includes("ffmpeg")) {
+          const pkgDir = path.join(wingetBase, pkg);
+          for (const sub of fs.readdirSync(pkgDir)) {
+            const candidate = path.join(pkgDir, sub, "bin", exeName);
+            if (fs.existsSync(candidate)) return candidate;
+          }
+        }
+      }
+    }
+  } catch (_) {}
+  return toolName;
+}
+
+const FFMPEG_BIN = resolveFfmpegTool("ffmpeg");
+const FFPLAY_BIN = resolveFfmpegTool("ffplay");
+
 // Protocol constants matching Android StreamTransport.kt
 const FRAME_TYPE_CONFIG = 0x01;
 const FRAME_TYPE_KEYFRAME = 0x02;
@@ -270,6 +297,14 @@ const tcpServer = net.createServer((socket) => {
   attachPhoneStreamSocket(socket, "Incoming Wi-Fi / ADB Reverse");
 });
 
+tcpServer.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.log(`[Info] TCP Stream Port ${STREAM_PORT} is already active in another HyperMirror instance.`);
+  } else {
+    console.warn(`[TCP Server Error] ${err.message}`);
+  }
+});
+
 tcpServer.listen(STREAM_PORT, "0.0.0.0", () => {
   console.log(`[HyperMirror TCP Server] Listening on 0.0.0.0:${STREAM_PORT} (TCP_NODELAY enabled)`);
 });
@@ -325,7 +360,7 @@ function toggleNativeFfplayWindow() {
   ];
 
   try {
-    ffplayProcess = spawn("ffplay", args, { stdio: ["pipe", "ignore", "ignore"] });
+    ffplayProcess = spawn(FFPLAY_BIN, args, { stdio: ["pipe", "ignore", "ignore"] });
     if (cachedConfigFrame && ffplayProcess.stdin) {
       ffplayProcess.stdin.write(cachedConfigFrame);
       sendCommandToPhone(CMD_REQUEST_IDR);
@@ -395,7 +430,7 @@ function toggleBuiltInSimulator(fps = 60, bitrateMbps = 12) {
       "pipe:1"
     ];
 
-    simulatorProcess = spawn("ffmpeg", ffArgs, { stdio: ["ignore", "pipe", "ignore"] });
+    simulatorProcess = spawn(FFMPEG_BIN, ffArgs, { stdio: ["ignore", "pipe", "ignore"] });
     let frameIndex = 0n;
 
     simulatorProcess.stdout.on("data", (nalChunk) => {
@@ -718,6 +753,16 @@ httpServer.on("upgrade", (req, socket) => {
 
   socket.on("close", () => wsClients.delete(socket));
   socket.on("error", () => wsClients.delete(socket));
+});
+
+httpServer.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.log(`================================================================`);
+    console.log(`  HyperMirror Pro PC Receiver is ALREADY running!`);
+    console.log(`  Open http://localhost:${WEB_PORT} in your browser.`);
+    console.log(`================================================================`);
+    process.exit(0);
+  }
 });
 
 httpServer.listen(WEB_PORT, "0.0.0.0", () => {
