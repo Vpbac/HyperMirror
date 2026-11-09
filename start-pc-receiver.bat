@@ -18,40 +18,35 @@ if exist "C:\Program Files\nodejs\node.exe" (
     set "NODE_EXE=%APPDATA%\npm\node.exe"
 ) else (
     where node.exe >nul 2>&1
-    if not errorlevel 1 (
-        set "NODE_EXE=node"
-    )
+    if not errorlevel 1 set "NODE_EXE=node"
 )
 
-:: 3. If Node.js is not installed on this PC, offer automatic 1-click install
-if "%NODE_EXE%"=="" (
-    echo ================================================================
-    echo   [THONG BAO] May tinh cua ban chua co Node.js
-    echo ================================================================
-    echo   PC Receiver can Node.js de khoi chay may chu sieu toc do.
-    echo.
-    where winget.exe >nul 2>&1
-    if not errorlevel 1 (
-        echo   Phat hien Windows Winget! Dang tu dong cai dat Node.js LTS...
-        winget install OpenJS.NodeJS.LTS -e --accept-package-agreements --accept-source-agreements
-        if not errorlevel 1 (
-            echo   Cai dat Node.js thanh cong! Dang khoi dong lai script...
-            set "PATH=%PATH%;C:\Program Files\nodejs;%LOCALAPPDATA%\Programs\nodejs"
-            if exist "C:\Program Files\nodejs\node.exe" set "NODE_EXE=C:\Program Files\nodejs\node.exe"
-        )
-    )
-    if "%NODE_EXE%"=="" (
-        echo   Khong the tu dong cai dat Node.js qua winget.
-        echo   Dang mo trinh duyet den trang chu Node.js de tai ve...
-        start "" "https://nodejs.org/en/download"
-        echo.
-        echo   Vui long tai va cai dat Node.js (ban LTS), sau do chay lai file nay!
-        echo ================================================================
-        pause
-        exit /b 1
-    )
+:: 3. If Node.js is not found, prompt or auto-install
+if defined NODE_EXE goto :NODE_READY
+
+echo ================================================================
+echo   [THONG BAO] May tinh cua ban chua cai dat Node.js
+echo ================================================================
+echo   PC Receiver can Node.js de khoi chay may chu sieu toc do.
+echo.
+where winget.exe >nul 2>&1
+if not errorlevel 1 (
+    echo   Phat hien Windows Winget! Dang tu dong cai dat Node.js LTS...
+    winget install OpenJS.NodeJS.LTS -e --accept-package-agreements --accept-source-agreements
+    if exist "C:\Program Files\nodejs\node.exe" set "NODE_EXE=C:\Program Files\nodejs\node.exe"
 )
 
+if defined NODE_EXE goto :NODE_READY
+
+echo   Dang mo trinh duyet den trang chu Node.js de tai ve...
+start "" "https://nodejs.org/en/download"
+echo.
+echo   Vui long cai dat Node.js ban LTS, sau do mo lai file bat nay!
+echo ================================================================
+pause
+exit /b 1
+
+:NODE_READY
 :: 4. Add Windows Firewall exception for Wi-Fi Direct streaming
 netsh advfirewall firewall show rule name="HyperMirror Pro Receiver" >nul 2>&1
 if errorlevel 1 (

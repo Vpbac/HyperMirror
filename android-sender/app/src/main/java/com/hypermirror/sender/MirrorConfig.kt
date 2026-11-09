@@ -4,8 +4,8 @@ import android.media.MediaFormat
 import java.io.Serializable
 
 enum class VideoCodecType(val id: Byte, val mimeType: String, val displayName: String) {
-    H264(1, MediaFormat.MIMETYPE_VIDEO_AVC, "H.264 (AVC - Giải mã nhanh nhất)"),
-    H265(1, MediaFormat.MIMETYPE_VIDEO_AVC, "H.265 / AVC High-Efficiency (Nén cao qua Wi-Fi)")
+    H264(1, MediaFormat.MIMETYPE_VIDEO_AVC, "H.264 (AVC - Khuyên dùng cho PC)"),
+    H265(2, MediaFormat.MIMETYPE_VIDEO_HEVC, "H.265 (HEVC - Yêu cầu PC hỗ trợ)")
 }
 
 enum class TransportMode(val displayName: String) {
