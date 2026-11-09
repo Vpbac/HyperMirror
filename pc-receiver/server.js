@@ -175,11 +175,12 @@ function broadcastBinaryVideoFrame(frameType, codecId, ptsUs, encodeDurationUs, 
   header.writeUInt32BE(encodeDurationUs, 10);
   const wsPacket = encodeWsFrame(0x02, Buffer.concat([header, payloadBuffer]));
   for (const sock of wsClients) {
-    if (!sock.destroyed) {
-      try {
-        sock.write(wsPacket);
-      } catch (_) {}
-    }
+    if (sock.destroyed) continue;
+    // MJPEG fallback frames are only for browsers that asked for them.
+    if (frameType === FRAME_TYPE_JPEG && !sock.wantsJpeg) continue;
+    try {
+      sock.write(wsPacket);
+    } catch (_) {}
   }
 }
 
@@ -209,8 +210,11 @@ function startUniversalDecoder(codecId = 1) {
   }
 
   const inputFormat = codecId === 2 ? "hevc" : "h264";
+  // NOTE: Do NOT add `-fflags nobuffer` here. On raw Annex-B H.264/HEVC from
+  // Android MediaCodec it makes FFmpeg's demuxer drop almost every frame (the
+  // MJPEG fallback then freezes on a single image). `-probesize` +
+  // `-analyzeduration` already keep the startup buffer small.
   const args = [
-    "-fflags", "nobuffer",
     "-flags", "low_delay",
     "-probesize", "65536",
     "-analyzeduration", "100000",
@@ -302,6 +306,27 @@ function stopUniversalDecoder() {
   }
 }
 
+// 4b. MJPEG fallback is expensive (software transcode + duplicate bandwidth),
+// so it is started lazily and ONLY while at least one browser needs it.
+function needsUniversalJpeg() {
+  for (const sock of wsClients) {
+    if (sock.wantsJpeg && !sock.destroyed) return true;
+  }
+  return false;
+}
+
+function refreshUniversalDecoder() {
+  if (!FFMPEG_BIN) return;
+  const want = needsUniversalJpeg() && streamMeta.connected && activePhoneSocket;
+  if (want && !universalDecoderProcess) {
+    if (process.env.HM_DEBUG) console.log("[Universal Decoder] starting (jpeg client present)");
+    startUniversalDecoder(streamMeta.codecId);
+  } else if (!want && universalDecoderProcess) {
+    if (process.env.HM_DEBUG) console.log("[Universal Decoder] stopping (no jpeg client / phone offline)");
+    stopUniversalDecoder();
+  }
+}
+
 function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
   if (activePhoneSocket && activePhoneSocket !== socket && !activePhoneSocket.destroyed) {
     try {
@@ -354,10 +379,13 @@ function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
           `[GMIR Handshake] Device=${deviceName} | ${width}x${height} @ ${fps}FPS | ${streamMeta.codec} | ${bitrateKbps} kbps`
         );
         broadcastJson({ type: "status", meta: streamMeta });
-        startUniversalDecoder(codecId);
+        refreshUniversalDecoder();
+        console.log(
+          `[GMIR] Stream ready | browsers=${wsClients.size} | jpegFallback=${needsUniversalJpeg() ? "ON" : "OFF"}`
+        );
       } else {
         handshakeDone = true;
-        startUniversalDecoder(1);
+        refreshUniversalDecoder();
       }
     }
 
@@ -416,6 +444,10 @@ function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
       activePhoneSocket = null;
       streamMeta.connected = false;
       stopUniversalDecoder();
+      if (ffplayProcess) {
+        try { ffplayProcess.kill(); } catch (_) {}
+        ffplayProcess = null;
+      }
       broadcastJson({ type: "status", meta: streamMeta });
       console.log("[Stream] Phone disconnected.");
     }
@@ -448,37 +480,51 @@ tcpServer.listen(STREAM_PORT, "0.0.0.0", () => {
 function connectToPhoneServer(host = "127.0.0.1", port = STREAM_PORT, label = "USB ADB Forward") {
   return new Promise((resolve, reject) => {
     if (activePhoneSocket && !activePhoneSocket.destroyed) {
-      resolve(true);
+      // A sender is already streaming; do not steal/replace the active socket.
+      resolve("already-connected");
       return;
     }
     const client = new net.Socket();
+    let settled = false;
+    let gotData = false;
+
+    // Never let an HTTP request hang forever if a TCP endpoint accepts but
+    // never sends the GMIR handshake (e.g. wrong port / adb forward without app).
+    const overallTimer = setTimeout(() => {
+      finish(new Error("Đã kết nối TCP nhưng không nhận được luồng GMIR (timeout 4s)"));
+    }, 4000);
+
+    function finish(err) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(overallTimer);
+      if (err) {
+        client.destroy();
+        reject(err);
+      } else {
+        resolve(true);
+      }
+    }
+
     client.setTimeout(1500);
     client.connect(port, host, () => {
       client.setTimeout(0);
-      let gotData = false;
-      const timer = setTimeout(() => {
+      const loopbackTimer = setTimeout(() => {
         if (!gotData && host === "127.0.0.1") {
-          client.destroy();
-          reject(new Error("Loopback self-connection ignored"));
+          finish(new Error("Loopback self-connection ignored"));
         }
       }, 600);
 
       client.once("data", (firstChunk) => {
         gotData = true;
-        clearTimeout(timer);
+        clearTimeout(loopbackTimer);
         attachPhoneStreamSocket(client, label);
         client.emit("data", firstChunk);
-        resolve(true);
+        finish();
       });
     });
-    client.on("error", (err) => {
-      client.destroy();
-      reject(err);
-    });
-    client.on("timeout", () => {
-      client.destroy();
-      reject(new Error("Connection timeout"));
-    });
+    client.on("error", (err) => finish(err));
+    client.on("timeout", () => finish(new Error("Connection timeout")));
   });
 }
 
@@ -556,15 +602,15 @@ function toggleNativeFfplayWindow() {
   }
 
   const inputCodec = streamMeta.codecId === 2 ? "hevc" : "h264";
+  // Keep startup buffering tiny, but DO NOT use `-fflags nobuffer`,
+  // `-probesize 32`, `-analyzeduration 0`, `-sync ext` or `-framedrop` here:
+  // with raw Annex-B streams they make FFplay fail stream detection or drop
+  // every frame (black/frozen window).
   const args = [
     "-f", inputCodec,
-    "-fflags", "nobuffer",
     "-flags", "low_delay",
-    "-framedrop",
-    "-strict", "experimental",
-    "-probesize", "32",
-    "-analyzeduration", "0",
-    "-sync", "ext",
+    "-probesize", "65536",
+    "-analyzeduration", "100000",
     "-window_title", `HyperMirror Pro Native Direct3D (${streamMeta.codec} Zero-Latency)`,
     "-i", "pipe:0",
   ];
@@ -840,11 +886,27 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/favicon.ico") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   if (url.pathname === "/api/connect-phone" && req.method === "POST") {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", async () => {
       try {
+        if (activePhoneSocket && !activePhoneSocket.destroyed) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              message: `Đang nhận luồng từ ${streamMeta.deviceName} (${streamMeta.remoteAddress}). Không cần kết nối thêm.`,
+            })
+          );
+          return;
+        }
         const { host, port } = JSON.parse(body || "{}");
         const targetHost = host || "127.0.0.1";
         const portsToTry = port ? [Number(port)] : [27184, 27183];
@@ -935,7 +997,10 @@ const httpServer = http.createServer(async (req, res) => {
       ".css": "text/css; charset=utf-8",
       ".js": "application/javascript; charset=utf-8",
     };
-    res.writeHead(200, { "Content-Type": mimeTypes[ext] || "application/octet-stream" });
+    res.writeHead(200, {
+      "Content-Type": mimeTypes[ext] || "application/octet-stream",
+      "Cache-Control": "no-store, must-revalidate",
+    });
     res.end(content);
   });
 });
@@ -962,7 +1027,13 @@ httpServer.on("upgrade", (req, socket) => {
   );
 
   socket.setNoDelay(true);
+
+  const reqUrl = new URL(req.url, "http://localhost");
+  const wantsJpeg = reqUrl.searchParams.get("jpeg") === "1";
+  socket.wantsJpeg = wantsJpeg;
+
   wsClients.add(socket);
+  refreshUniversalDecoder();
 
   socket.write(encodeWsFrame(0x01, Buffer.from(JSON.stringify({ type: "status", meta: streamMeta }))));
   if (cachedConfigFrame) {
@@ -975,8 +1046,14 @@ httpServer.on("upgrade", (req, socket) => {
     sendCommandToPhone(CMD_REQUEST_IDR);
   }
 
-  socket.on("close", () => wsClients.delete(socket));
-  socket.on("error", () => wsClients.delete(socket));
+  socket.on("close", () => {
+    wsClients.delete(socket);
+    refreshUniversalDecoder();
+  });
+  socket.on("error", () => {
+    wsClients.delete(socket);
+    refreshUniversalDecoder();
+  });
 });
 
 httpServer.on("error", (err) => {

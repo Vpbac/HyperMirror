@@ -48,6 +48,10 @@
   let lastWebCodecsFrameTime = 0;
   let lastIdrRequestTime = 0;
   let isRenderingBitmap = false;
+  // If the GPU decoder refuses this profile (or WebCodecs is missing), switch
+  // to the server MJPEG fallback instead of retrying forever.
+  let useJpegFallback = !("VideoDecoder" in window);
+  let decoderErrorStreak = 0;
 
   // Viewport Transform State
   let cropLandscape16x9 = false;
@@ -266,6 +270,7 @@
       output: (frame) => {
         const now = performance.now();
         lastWebCodecsFrameTime = now;
+        decoderErrorStreak = 0;
         const startT = pendingDecodeTimestamps.get(frame.timestamp);
         if (startT !== undefined) {
           decodeMsWindow += now - startT;
@@ -279,8 +284,30 @@
         frameCountWindow++;
       },
       error: (err) => {
-        console.warn("[WebCodecs decode error, requesting fresh IDR]", err);
+        console.warn("[WebCodecs decode error]", err);
         waitingForKeyFrame = true;
+        pendingDecodeTimestamps.clear();
+        // A decoder that errored is dead: release it and stop re-configuring
+        // every single frame (prevents an endless warning/IDR flood).
+        try {
+          if (videoDecoder && videoDecoder.state !== "closed") videoDecoder.close();
+        } catch (_) {}
+        videoDecoder = null;
+        activeCodecId = 0;
+        decoderErrorStreak++;
+        if (decoderErrorStreak >= 2 && !useJpegFallback) {
+          useJpegFallback = true;
+          setToast(
+            "GPU WebCodecs không hỗ trợ codec này — đã chuyển sang chế độ giải mã JPEG dự phòng."
+          );
+          // Reconnect so the server starts the MJPEG fallback pipeline.
+          try {
+            currentWs.close();
+          } catch (_) {}
+          scheduleReconnect(200);
+          return;
+        }
+        lastWebCodecsFrameTime = 0;
         requestIdrThrottled();
       },
     });
@@ -354,9 +381,13 @@
     const payloadBytes = new Uint8Array(arrayBuffer, 14);
 
     if (frameType === 5) {
+      byteCountWindow += payloadBytes.byteLength;
       renderUniversalJpegFrame(payloadBytes, encodeDurationUs);
       return;
     }
+
+    // GPU path unavailable/failed: ignore raw H.264 packets (MJPEG will arrive).
+    if (useJpegFallback) return;
 
     byteCountWindow += payloadBytes.byteLength;
     encodeUsWindow += encodeDurationUs;
@@ -453,10 +484,35 @@
     lastStatTime = now;
   }, 500);
 
+  let currentWs = null;
+  let reconnectTimer = null;
+
+  function scheduleReconnect(delay = 1200) {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connectWebSocket();
+    }, delay);
+  }
+
   function connectWebSocket() {
+    // Never leave a half-open socket behind (our minimal server does not
+    // acknowledge the WS close handshake, so onclose can take ~30s).
+    if (currentWs) {
+      try {
+        currentWs.onclose = null;
+        currentWs.close();
+      } catch (_) {}
+      currentWs = null;
+    }
+
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}`);
+    const wantJpeg = useJpegFallback ? 1 : 0;
+    const ws = new WebSocket(
+      `${proto}://${location.host}/?jpeg=${wantJpeg}&t=${Date.now()}`
+    );
     ws.binaryType = "arraybuffer";
+    currentWs = ws;
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
@@ -481,7 +537,8 @@
     };
 
     ws.onclose = () => {
-      setTimeout(connectWebSocket, 1200);
+      if (currentWs === ws) currentWs = null;
+      scheduleReconnect();
     };
   }
 
