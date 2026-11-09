@@ -4,8 +4,8 @@
  * 1. Auto USB Wired Tunnel (Auto ADB Forward + ADB Reverse + Active Poll)
  * 2. Wi-Fi 5GHz/6GHz Direct Socket Mode (:27183)
  * 3. Dual Browser Rendering Engine:
- *    - WebCodecs GPU Hardware Decoder (VideoDecoder optimizeForLatency: true)
- *    - Universal Zero-Latency FFmpeg MJPEG/Bitmap Stream (Guaranteed 60FPS on all browsers & codecs)
+ *    - Primary: WebCodecs GPU Hardware Decoder (VideoDecoder optimizeForLatency: true, Zero external dependencies!)
+ *    - Optional Fallback: FFmpeg MJPEG Stream (only if ffmpeg is installed)
  * 4. Native Direct3D11 / SDL Ultra-Low-Latency Window (via FFplay Zero-Buffer pipe)
  */
 
@@ -15,38 +15,66 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const os = require("os");
-const { spawn, exec } = require("child_process");
+const { spawn, exec, execSync } = require("child_process");
 
 const STREAM_PORT = Number(process.env.STREAM_PORT || 27183);
 const WEB_PORT = Number(process.env.WEB_PORT || 3080);
 
+// Global crash protection so child_process or socket errors never terminate the server
+process.on("uncaughtException", (err) => {
+  console.warn(`[SafeGuard] Ignored non-fatal exception: ${err.message}`);
+});
+process.on("unhandledRejection", (reason) => {
+  console.warn(`[SafeGuard] Ignored unhandled rejection: ${reason}`);
+});
+
 function resolveFfmpegTool(toolName) {
   const exeName = process.platform === "win32" ? `${toolName}.exe` : toolName;
-  const wingetBase = path.join(
-    process.env.LOCALAPPDATA || "",
-    "Microsoft",
-    "WinGet",
-    "Packages"
-  );
+  const localAppData =
+    process.env.LOCALAPPDATA ||
+    path.join(os.homedir(), "AppData", "Local");
+
+  const wingetBase = path.join(localAppData, "Microsoft", "WinGet", "Packages");
   try {
     if (fs.existsSync(wingetBase)) {
       for (const pkg of fs.readdirSync(wingetBase)) {
         if (pkg.toLowerCase().includes("ffmpeg")) {
           const pkgDir = path.join(wingetBase, pkg);
+          if (!fs.statSync(pkgDir).isDirectory()) continue;
           for (const sub of fs.readdirSync(pkgDir)) {
-            const candidate = path.join(pkgDir, sub, "bin", exeName);
-            if (fs.existsSync(candidate)) return candidate;
+            const subDir = path.join(pkgDir, sub);
+            try {
+              if (!fs.statSync(subDir).isDirectory()) continue;
+              const candidate = path.join(subDir, "bin", exeName);
+              if (fs.existsSync(candidate)) return candidate;
+            } catch (_) {}
           }
         }
       }
     }
   } catch (_) {}
-  return toolName;
+
+  // Check `where.exe` on Windows
+  try {
+    const out = execSync(`where.exe ${exeName}`, {
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1500,
+    })
+      .toString()
+      .trim()
+      .split(/\r?\n/)[0];
+    if (out && fs.existsSync(out)) return out;
+  } catch (_) {}
+
+  return null; // Not installed or not found
 }
 
 function resolveAdbTool() {
+  const localAppData =
+    process.env.LOCALAPPDATA ||
+    path.join(os.homedir(), "AppData", "Local");
   const sdkAdb = path.join(
-    process.env.LOCALAPPDATA || "",
+    localAppData,
     "Android",
     "Sdk",
     "platform-tools",
@@ -64,7 +92,7 @@ const FRAME_TYPE_CONFIG = 0x01;
 const FRAME_TYPE_KEYFRAME = 0x02;
 const FRAME_TYPE_NORMAL = 0x03;
 const FRAME_TYPE_PING = 0x04;
-const FRAME_TYPE_JPEG = 0x05; // Universal decoded frame for 100% browser compatibility
+const FRAME_TYPE_JPEG = 0x05;
 
 const CMD_REQUEST_IDR = 0x10;
 const CMD_SET_BITRATE = 0x11;
@@ -77,8 +105,8 @@ let streamMeta = {
   deviceName: "-",
   codec: "H.264",
   codecId: 1,
-  width: 1080,
-  height: 1920,
+  width: 1920,
+  height: 1080,
   targetFps: 60,
   targetBitrateKbps: 16000,
 };
@@ -130,7 +158,9 @@ function broadcastJson(obj) {
   const frame = encodeWsFrame(0x01, payload);
   for (const sock of wsClients) {
     if (!sock.destroyed) {
-      sock.write(frame);
+      try {
+        sock.write(frame);
+      } catch (_) {}
     }
   }
 }
@@ -145,7 +175,9 @@ function broadcastBinaryVideoFrame(frameType, codecId, ptsUs, encodeDurationUs, 
   const wsPacket = encodeWsFrame(0x02, Buffer.concat([header, payloadBuffer]));
   for (const sock of wsClients) {
     if (!sock.destroyed) {
-      sock.write(wsPacket);
+      try {
+        sock.write(wsPacket);
+      } catch (_) {}
     }
   }
 }
@@ -166,12 +198,15 @@ function sendCommandToPhone(cmdByte, payloadBuf = Buffer.alloc(0)) {
 }
 
 /**
- * Universal Zero-Latency FFmpeg Decoder Pipe
- * Decodes incoming H.264 / H.265 stream in real-time and emits JPEG frames (FRAME_TYPE_JPEG = 0x05)
- * so the browser canvas ALWAYS displays the video immediately even if WebCodecs rejects a device profile!
+ * Optional Universal FFmpeg Decoder Pipe (only runs if FFMPEG_BIN is found on system)
  */
 function startUniversalDecoder(codecId = 1) {
   stopUniversalDecoder();
+  if (!FFMPEG_BIN) {
+    // WebCodecs in browser handles H.264/H.265 hardware decoding directly without needing ffmpeg
+    return;
+  }
+
   const inputFormat = codecId === 2 ? "hevc" : "h264";
   const args = [
     "-fflags", "nobuffer",
@@ -190,54 +225,68 @@ function startUniversalDecoder(codecId = 1) {
     const proc = spawn(FFMPEG_BIN, args, { stdio: ["pipe", "pipe", "ignore"] });
     universalDecoderProcess = proc;
 
-    if (cachedConfigFrame && proc.stdin && !proc.stdin.destroyed) {
-      proc.stdin.write(cachedConfigFrame);
+    proc.on("error", (err) => {
+      console.warn(`[Universal Decoder] FFmpeg unavailable (${err.message}), using WebCodecs GPU directly.`);
+      if (universalDecoderProcess === proc) {
+        universalDecoderProcess = null;
+      }
+    });
+
+    if (proc.stdin) {
+      proc.stdin.on("error", () => {});
+      if (cachedConfigFrame && !proc.stdin.destroyed) {
+        try {
+          proc.stdin.write(cachedConfigFrame);
+        } catch (_) {}
+      }
     }
 
     let jpegAcc = Buffer.alloc(0);
-    proc.stdout.on("data", (chunk) => {
-      jpegAcc = jpegAcc.length === 0 ? chunk : Buffer.concat([jpegAcc, chunk]);
+    if (proc.stdout) {
+      proc.stdout.on("error", () => {});
+      proc.stdout.on("data", (chunk) => {
+        jpegAcc = jpegAcc.length === 0 ? chunk : Buffer.concat([jpegAcc, chunk]);
 
-      // Extract complete JPEG frames (SOI 0xFFD8 ... EOI 0xFFD9)
-      while (true) {
-        let soi = -1;
-        for (let i = 0; i < jpegAcc.length - 1; i++) {
-          if (jpegAcc[i] === 0xff && jpegAcc[i + 1] === 0xd8) {
-            soi = i;
+        while (true) {
+          let soi = -1;
+          for (let i = 0; i < jpegAcc.length - 1; i++) {
+            if (jpegAcc[i] === 0xff && jpegAcc[i + 1] === 0xd8) {
+              soi = i;
+              break;
+            }
+          }
+          if (soi < 0) {
+            jpegAcc = Buffer.alloc(0);
             break;
           }
-        }
-        if (soi < 0) {
-          jpegAcc = Buffer.alloc(0);
-          break;
-        }
-        let eoi = -1;
-        for (let i = soi + 2; i < jpegAcc.length - 1; i++) {
-          if (jpegAcc[i] === 0xff && jpegAcc[i + 1] === 0xd9) {
-            eoi = i + 2;
+          let eoi = -1;
+          for (let i = soi + 2; i < jpegAcc.length - 1; i++) {
+            if (jpegAcc[i] === 0xff && jpegAcc[i + 1] === 0xd9) {
+              eoi = i + 2;
+              break;
+            }
+          }
+          if (eoi < 0) {
+            if (soi > 0) jpegAcc = jpegAcc.subarray(soi);
             break;
           }
-        }
-        if (eoi < 0) {
-          if (soi > 0) jpegAcc = jpegAcc.subarray(soi);
-          break;
-        }
 
-        const jpegFrame = jpegAcc.subarray(soi, eoi);
-        jpegAcc = jpegAcc.subarray(eoi);
+          const jpegFrame = jpegAcc.subarray(soi, eoi);
+          jpegAcc = jpegAcc.subarray(eoi);
 
-        const nowUs = BigInt(Date.now()) * 1000n;
-        broadcastBinaryVideoFrame(FRAME_TYPE_JPEG, codecId, nowUs, 1800, jpegFrame);
-      }
-    });
+          const nowUs = BigInt(Date.now()) * 1000n;
+          broadcastBinaryVideoFrame(FRAME_TYPE_JPEG, codecId, nowUs, 1800, jpegFrame);
+        }
+      });
+    }
 
     proc.on("exit", () => {
       if (universalDecoderProcess === proc) {
         universalDecoderProcess = null;
       }
     });
-  } catch (err) {
-    console.warn("[Universal Decoder] Failed to spawn ffmpeg:", err.message);
+  } catch (_) {
+    universalDecoderProcess = null;
   }
 }
 
@@ -252,7 +301,6 @@ function stopUniversalDecoder() {
 
 function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
   if (activePhoneSocket && activePhoneSocket !== socket && !activePhoneSocket.destroyed) {
-    // Already have an active phone connection; ignore duplicate connection attempt
     try {
       socket.destroy();
     } catch (_) {}
@@ -341,21 +389,18 @@ function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
         cachedConfigFrame = payload;
       }
 
-      // Feed Native FFplay Direct3D window if open
       if (ffplayProcess && ffplayProcess.stdin && !ffplayProcess.stdin.destroyed) {
         try {
           ffplayProcess.stdin.write(payload);
         } catch (_) {}
       }
 
-      // Feed Universal FFmpeg Decoder Pipe
       if (universalDecoderProcess && universalDecoderProcess.stdin && !universalDecoderProcess.stdin.destroyed) {
         try {
           universalDecoderProcess.stdin.write(payload);
         } catch (_) {}
       }
 
-      // Broadcast raw NAL to WebCodecs clients
       broadcastBinaryVideoFrame(frameType, streamMeta.codecId, ptsUs, encodeDurationUs, payload);
     }
   });
@@ -404,7 +449,6 @@ function connectToPhoneServer(host = "127.0.0.1", port = STREAM_PORT, label = "U
     client.setTimeout(1500);
     client.connect(port, host, () => {
       client.setTimeout(0);
-      // Verify it's not connecting to our own PC server when adb forward is not active
       let gotData = false;
       const timer = setTimeout(() => {
         if (!gotData && host === "127.0.0.1") {
@@ -439,7 +483,6 @@ setInterval(() => {
     `${ADB_CMD} forward tcp:27184 tcp:${STREAM_PORT} && ${ADB_CMD} reverse tcp:${STREAM_PORT} tcp:${STREAM_PORT}`,
     (err) => {
       if (!err && (!activePhoneSocket || activePhoneSocket.destroyed)) {
-        // Connect to phone's server via dedicated forwarded port 27184 (avoids colliding with PC's port 27183!)
         connectToPhoneServer("127.0.0.1", 27184, "Auto USB Cable").catch(() => {});
       }
     }
@@ -457,6 +500,13 @@ function toggleNativeFfplayWindow() {
     return { active: false };
   }
 
+  if (!FFPLAY_BIN) {
+    return {
+      active: false,
+      error: "Không tìm thấy ffplay.exe trên máy. Hãy xem trực tiếp trên trình duyệt (WebCodecs GPU)!",
+    };
+  }
+
   const inputCodec = streamMeta.codecId === 2 ? "hevc" : "h264";
   const args = [
     "-f", inputCodec,
@@ -472,13 +522,23 @@ function toggleNativeFfplayWindow() {
   ];
 
   try {
-    ffplayProcess = spawn(FFPLAY_BIN, args, { stdio: ["pipe", "ignore", "ignore"] });
-    if (cachedConfigFrame && ffplayProcess.stdin) {
-      ffplayProcess.stdin.write(cachedConfigFrame);
-      sendCommandToPhone(CMD_REQUEST_IDR);
+    const proc = spawn(FFPLAY_BIN, args, { stdio: ["pipe", "ignore", "ignore"] });
+    ffplayProcess = proc;
+    proc.on("error", () => {
+      if (ffplayProcess === proc) ffplayProcess = null;
+      broadcastJson({ type: "ffplay", active: false });
+    });
+    if (proc.stdin) {
+      proc.stdin.on("error", () => {});
+      if (cachedConfigFrame) {
+        try {
+          proc.stdin.write(cachedConfigFrame);
+        } catch (_) {}
+        sendCommandToPhone(CMD_REQUEST_IDR);
+      }
     }
-    ffplayProcess.on("exit", () => {
-      ffplayProcess = null;
+    proc.on("exit", () => {
+      if (ffplayProcess === proc) ffplayProcess = null;
       broadcastJson({ type: "ffplay", active: false });
     });
     broadcastJson({ type: "ffplay", active: true });
@@ -504,6 +564,10 @@ function toggleBuiltInSimulator(fps = 60, bitrateMbps = 12) {
     }
     broadcastJson({ type: "simulator", active: false });
     return { active: false };
+  }
+
+  if (!FFMPEG_BIN) {
+    return { active: false, error: "Cần cài FFmpeg để chạy bộ giả lập luồng." };
   }
 
   const width = 1280;
@@ -538,46 +602,58 @@ function toggleBuiltInSimulator(fps = 60, bitrateMbps = 12) {
       "pipe:1",
     ];
 
-    simulatorProcess = spawn(FFMPEG_BIN, ffArgs, { stdio: ["ignore", "pipe", "ignore"] });
-    let frameIndex = 0n;
-
-    simulatorProcess.stdout.on("data", (nalChunk) => {
-      if (sock.destroyed) return;
-      const ptsUs = (frameIndex * 1000000n) / BigInt(fps);
-      frameIndex++;
-
-      let fType = FRAME_TYPE_NORMAL;
-      for (let i = 0; i < nalChunk.length - 4; i++) {
-        if (
-          nalChunk[i] === 0 &&
-          nalChunk[i + 1] === 0 &&
-          nalChunk[i + 2] === 0 &&
-          nalChunk[i + 3] === 1
-        ) {
-          const nalType = nalChunk[i + 4] & 0x1f;
-          if (nalType === 5 || nalType === 7) {
-            fType = FRAME_TYPE_KEYFRAME;
-            break;
-          }
-        }
-      }
-
-      const pkt = Buffer.allocUnsafe(17 + nalChunk.length);
-      pkt.writeUInt8(fType, 0);
-      pkt.writeBigInt64BE(ptsUs, 1);
-      pkt.writeUInt32BE(1450, 9);
-      pkt.writeUInt32BE(nalChunk.length, 13);
-      nalChunk.copy(pkt, 17);
-      sock.write(pkt);
+    const proc = spawn(FFMPEG_BIN, ffArgs, { stdio: ["ignore", "pipe", "ignore"] });
+    simulatorProcess = proc;
+    proc.on("error", () => {
+      if (simulatorProcess === proc) simulatorProcess = null;
+      if (!sock.destroyed) sock.destroy();
+      broadcastJson({ type: "simulator", active: false });
     });
 
-    simulatorProcess.on("exit", () => {
-      simulatorProcess = null;
+    let frameIndex = 0n;
+    if (proc.stdout) {
+      proc.stdout.on("error", () => {});
+      proc.stdout.on("data", (nalChunk) => {
+        if (sock.destroyed) return;
+        const ptsUs = (frameIndex * 1000000n) / BigInt(fps);
+        frameIndex++;
+
+        let fType = FRAME_TYPE_NORMAL;
+        for (let i = 0; i < nalChunk.length - 4; i++) {
+          if (
+            nalChunk[i] === 0 &&
+            nalChunk[i + 1] === 0 &&
+            nalChunk[i + 2] === 0 &&
+            nalChunk[i + 3] === 1
+          ) {
+            const nalType = nalChunk[i + 4] & 0x1f;
+            if (nalType === 5 || nalType === 7) {
+              fType = FRAME_TYPE_KEYFRAME;
+              break;
+            }
+          }
+        }
+
+        const pkt = Buffer.allocUnsafe(17 + nalChunk.length);
+        pkt.writeUInt8(fType, 0);
+        pkt.writeBigInt64BE(ptsUs, 1);
+        pkt.writeUInt32BE(1450, 9);
+        pkt.writeUInt32BE(nalChunk.length, 13);
+        nalChunk.copy(pkt, 17);
+        try {
+          sock.write(pkt);
+        } catch (_) {}
+      });
+    }
+
+    proc.on("exit", () => {
+      if (simulatorProcess === proc) simulatorProcess = null;
       if (!sock.destroyed) sock.destroy();
       broadcastJson({ type: "simulator", active: false });
     });
   });
 
+  sock.on("error", () => {});
   simulatorSocket = sock;
   broadcastJson({ type: "simulator", active: true });
   return { active: true };
@@ -857,5 +933,6 @@ httpServer.listen(WEB_PORT, "0.0.0.0", () => {
   console.log(`  HYPERMIRROR PRO - PC GAMING RECEIVER READY`);
   console.log(`  - Control Center UI : http://localhost:${WEB_PORT}`);
   console.log(`  - LAN Wi-Fi IP(s)   : ${ips} (TCP Port ${STREAM_PORT})`);
+  console.log(`  - FFmpeg Engine     : ${FFMPEG_BIN ? "Found" : "WebCodecs GPU Direct Mode"}`);
   console.log(`================================================================`);
 });
