@@ -489,6 +489,8 @@ udpBeacon.bind(0, () => {
   } catch (_) {}
 });
 
+let adbCheckInProgress = false;
+
 setInterval(() => {
   // Broadcast PC presence on Wi-Fi LAN so Android phones auto-fill the PC IP
   const msg = Buffer.from(`GMIR_PC_HERE:${STREAM_PORT}`);
@@ -504,15 +506,19 @@ setInterval(() => {
   } catch (_) {}
 
   if (activePhoneSocket && !activePhoneSocket.destroyed) return;
+  if (adbCheckInProgress) return;
+  adbCheckInProgress = true;
   exec(
     `${ADB_CMD} forward tcp:27184 tcp:27184 && ${ADB_CMD} reverse tcp:${STREAM_PORT} tcp:${STREAM_PORT}`,
+    { timeout: 1800 },
     (err) => {
+      adbCheckInProgress = false;
       if (!err && (!activePhoneSocket || activePhoneSocket.destroyed)) {
         connectToPhoneServer("127.0.0.1", 27184, "Auto USB Cable").catch(() => {});
       }
     }
   );
-}, 2000);
+}, 3000);
 
 // 4. Native FFplay Direct3D Window
 function toggleNativeFfplayWindow() {
