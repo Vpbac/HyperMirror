@@ -95,18 +95,18 @@
         const outR = out[1];
         const n = outL.length;
 
-        if (this.available >= n) {
-          for (let i = 0; i < n; i++) {
-            outL[i] = this.bufL[this.readPos];
-            outR[i] = this.bufR[this.readPos];
-            this.readPos = (this.readPos + 1) % this.capacity;
-          }
-          this.available -= n;
-        } else {
-          outL.fill(0);
-          outR.fill(0);
-          this.available = 0;
+        const samplesToRead = Math.min(this.available, n);
+        for (let i = 0; i < samplesToRead; i++) {
+          outL[i] = this.bufL[this.readPos];
+          outR[i] = this.bufR[this.readPos];
+          this.readPos = (this.readPos + 1) % this.capacity;
         }
+        // Audio packets are 480 samples (10 ms), while browsers usually render
+        // 128-sample quanta. Keep the tail for the next quantum instead of
+        // discarding it whenever fewer than n samples are queued.
+        outL.fill(0, samplesToRead);
+        outR.fill(0, samplesToRead);
+        this.available -= samplesToRead;
         return true;
       }
     }
