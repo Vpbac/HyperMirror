@@ -10,32 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  publish-release:
-    name: Publish APK to GitHub Releases
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Create/Update GitHub Release v1.0.0
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v1.0.0
-          name: "HyperMirror Pro v1.0.0 (Android Ultra-Low Latency APK)"
-          body: |
-            ## 🎮 HyperMirror Pro v1.0.0 — Android ➔ PC Gaming Screen Mirroring
-            - **Zero-Copy Hardware Encoding**: `MediaProjection` + `MediaCodec` (H.264 AVC / H.265 HEVC)
-            - **Ultra-Low Latency**: 60 / 90 / 120 FPS, `0 B-Frames`, `KEY_LOW_LATENCY`, `TCP_NODELAY`, `WIFI_MODE_FULL_LOW_LATENCY`
-            - **Dual Transport**: Cáp USB (`adb forward` / `adb reverse`) & Wi-Fi 5GHz/6GHz
-
-            ### 📲 Cài đặt trên Android
-            Tải file **`HyperMirrorSender-debug.apk`** ở mục **Assets** bên dưới và cài đặt trực tiếp lên điện thoại Android (Android 8.0 - Android 14+).
-          draft: false
-          prerelease: false
-          files: |
-            HyperMirrorSender-debug.apk
-
-  build-from-source:
+  build-apk:
     name: Verify & Build APK from Source
     runs-on: ubuntu-latest
     steps:
@@ -62,3 +37,26 @@ jobs:
         with:
           name: HyperMirrorSender-debug-apk
           path: android-sender/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
+
+  publish-release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-apk
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built APK
+        uses: actions/download-artifact@v4
+        with:
+          name: HyperMirrorSender-debug-apk
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "HyperMirror Pro ${{ github.ref_name }}"
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: false
+          files: dist/app-debug.apk
