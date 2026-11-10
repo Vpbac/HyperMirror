@@ -10,6 +10,9 @@
     <!-- Keep CPU and Wi-Fi chip in Ultra-Low-Latency Gaming state -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Audio Recording Permission for Game Audio Playback Capture (Android 10+) -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
     <!-- Foreground Service permissions for Android 10-14+ MediaProjection -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />

@@ -45,6 +45,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val audioPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (!isGranted) {
+            Toast.makeText(this, "Không có quyền Audio: Sẽ chỉ truyền hình ảnh, không có âm thanh", Toast.LENGTH_SHORT).show()
+        }
+        launchScreenCapture()
+    }
+
     private val capturePermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -175,16 +184,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 startService(stopIntent)
             } else {
-                val targetIp = binding.etTargetIp.text.toString().trim()
-                if (targetIp.isNotEmpty()) {
-                    getSharedPreferences("hypermirror_prefs", Context.MODE_PRIVATE)
-                        .edit()
-                        .putString("last_pc_ip", targetIp)
-                        .apply()
-                }
-                val projectionManager =
-                    getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                capturePermissionLauncher.launch(projectionManager.createScreenCaptureIntent())
+                checkPermissionsAndStart()
             }
         }
 
@@ -192,6 +192,29 @@ class MainActivity : AppCompatActivity() {
             mirrorService?.requestKeyFrameNow()
             Toast.makeText(this, "Đã gửi khung hình IDR (KeyFrame) tức thì", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun checkPermissionsAndStart() {
+        val targetIp = binding.etTargetIp.text.toString().trim()
+        if (targetIp.isNotEmpty()) {
+            getSharedPreferences("hypermirror_prefs", Context.MODE_PRIVATE)
+                .edit()
+                .putString("last_pc_ip", targetIp)
+                .apply()
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+            ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            audioPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+        } else {
+            launchScreenCapture()
+        }
+    }
+
+    private fun launchScreenCapture() {
+        val projectionManager =
+            getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        capturePermissionLauncher.launch(projectionManager.createScreenCaptureIntent())
     }
 
     private fun observeTelemetry() {

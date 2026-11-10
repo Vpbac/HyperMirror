@@ -300,6 +300,17 @@ input[type="range"] {
   align-items: flex-end;
 }
 
+.hud-clickable {
+  cursor: pointer;
+  user-select: none;
+  transition: transform 0.15s ease, opacity 0.15s ease;
+}
+
+.hud-clickable:hover {
+  transform: scale(1.04);
+  opacity: 0.85;
+}
+
 .hud-metric .label {
   font-size: 10px;
   color: var(--text-muted);

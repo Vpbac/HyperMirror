@@ -52,6 +52,7 @@ class MirrorForegroundService : Service() {
     private val binder = LocalBinder()
     private var mediaProjection: MediaProjection? = null
     private var encoder: LowLatencyEncoder? = null
+    private var audioStreamer: AudioStreamer? = null
     private var transport: StreamTransport? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -172,6 +173,11 @@ class MirrorForegroundService : Service() {
 
             if (hwEncoder.start()) {
                 streamTransport.start(hwEncoder.encodedWidth, hwEncoder.encodedHeight)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    audioStreamer = AudioStreamer(projection, streamTransport).apply {
+                        start()
+                    }
+                }
                 _isRunningFlow.value = true
             } else {
                 Log.e(TAG, "Hardware encoder failed all configuration tiers")
@@ -232,6 +238,11 @@ class MirrorForegroundService : Service() {
 
     fun stopMirrorSession() {
         _isRunningFlow.value = false
+        try {
+            audioStreamer?.stop()
+        } catch (_: Exception) {
+        }
+        audioStreamer = null
         try {
             encoder?.stop()
         } catch (_: Exception) {

@@ -34,6 +34,7 @@ class StreamTransport(
         const val FRAME_TYPE_KEYFRAME: Byte = 0x02
         const val FRAME_TYPE_NORMAL: Byte = 0x03
         const val FRAME_TYPE_PING: Byte = 0x04
+        const val FRAME_TYPE_AUDIO: Byte = 0x06
 
         const val CMD_REQUEST_IDR: Byte = 0x10
         const val CMD_SET_BITRATE: Byte = 0x11
@@ -292,6 +293,15 @@ class StreamTransport(
             if (frameType != FRAME_TYPE_KEYFRAME && frameType != FRAME_TYPE_CONFIG) {
                 onRequestSyncFrame()
             }
+        }
+    }
+
+    fun sendAudioFrame(ptsUs: Long, sampleRate: Int, data: ByteArray) {
+        val out = outputStream ?: return
+        try {
+            sendFrameInternal(out, FRAME_TYPE_AUDIO, ptsUs, sampleRate, data)
+        } catch (_: Exception) {
+            closeActiveSocketOnly()
         }
     }
 

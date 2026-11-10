@@ -80,6 +80,16 @@
         </div>
 
         <button id="btnForceIdr" class="btn btn-outline">🔄 Làm tươi Khung hình (IDR)</button>
+
+        <div class="info-row" style="margin-top: 14px;">
+          <span>Âm thanh Game / Media:</span>
+          <button id="btnToggleAudio" class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px; width: auto;">🔊 Đang bật (M)</button>
+        </div>
+        <div class="slider-header" style="margin-top: 6px;">
+          <span style="font-size: 11px;">Âm lượng PC:</span>
+          <strong id="lblVolumeVal" class="highlight-cyan" style="font-size: 12px;">100%</strong>
+        </div>
+        <input id="sliderVolume" type="range" min="0" max="100" step="1" value="100" style="margin-top: 2px;" />
       </section>
 
       <!-- Dual Render Mode & Built-in Simulator -->
@@ -128,6 +138,11 @@
           <strong id="hudDecodeMs">0.00 ms</strong>
         </div>
 
+        <div class="hud-metric hud-clickable" id="hudAudioMetric" style="cursor:pointer;" title="Bật/Tắt âm thanh (Phím M)">
+          <span class="label">ÂM THANH (M)</span>
+          <strong id="hudAudioStatus" class="highlight-cyan">🔊 BẬT</strong>
+        </div>
+
         <button id="btnQuickCinema" class="btn-hud" title="Ẩn/Hiện thanh bên để xem rộng toàn cửa sổ (Phím H)">
           Ẩn Menu (H)
         </button>
@@ -142,6 +157,7 @@
           <button id="btnFloatCrop" class="btn-float">✂️ Cắt Viền Đen (C)</button>
           <button id="btnFloatRotate" class="btn-float">🔄 Xoay 90° (R)</button>
           <button id="btnFloatScale" class="btn-float">⤢ Lấp Đầy 16:9 (Z)</button>
+          <button id="btnFloatAudio" class="btn-float">🔊 Âm thanh (M)</button>
           <button id="btnFloatExitFs" class="btn-float">✕ Thoát Fullscreen (F / Esc)</button>
         </div>
 

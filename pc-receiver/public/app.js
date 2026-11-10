@@ -40,6 +40,213 @@
   const btnSimulator = document.getElementById("btnSimulator");
   const viewportContainer = document.getElementById("viewportContainer");
 
+  // Audio Controls & Telemetry
+  const hudAudioMetric = document.getElementById("hudAudioMetric");
+  const hudAudioStatus = document.getElementById("hudAudioStatus");
+  const btnToggleAudio = document.getElementById("btnToggleAudio");
+  const sliderVolume = document.getElementById("sliderVolume");
+  const lblVolumeVal = document.getElementById("lblVolumeVal");
+  const btnFloatAudio = document.getElementById("btnFloatAudio");
+
+  let audioCtx = null;
+  let gainNode = null;
+  let audioWorkletNode = null;
+  let isWorkletInitializing = false;
+  let isAudioMuted = false;
+  let audioVolume = 1.0;
+  let nextAudioPlayTime = 0;
+
+  const workletProcessorCode = `
+    class HyperAudioProcessor extends AudioWorkletProcessor {
+      constructor() {
+        super();
+        this.capacity = 48000;
+        this.bufL = new Float32Array(this.capacity);
+        this.bufR = new Float32Array(this.capacity);
+        this.writePos = 0;
+        this.readPos = 0;
+        this.available = 0;
+        // Strict Zero-Latency Target for Competitive Gaming (Wuwa / Lien Quan / Vuong Gia)
+        this.targetSamples = 480;  // 10ms buffer @ 48kHz
+        this.maxSamples = 720;     // 15ms maximum clamp
+
+        this.port.onmessage = (e) => {
+          const { left, right } = e.data;
+          const len = left.length;
+          for (let i = 0; i < len; i++) {
+            this.bufL[this.writePos] = left[i];
+            this.bufR[this.writePos] = right[i];
+            this.writePos = (this.writePos + 1) % this.capacity;
+          }
+          this.available += len;
+
+          // Latency Clamp: if audio backlog builds up beyond 15ms, immediately advance read pointer to 10ms!
+          if (this.available > this.maxSamples) {
+            const skip = this.available - this.targetSamples;
+            this.readPos = (this.readPos + skip) % this.capacity;
+            this.available = this.targetSamples;
+          }
+        };
+      }
+
+      process(inputs, outputs) {
+        const out = outputs[0];
+        const outL = out[0];
+        const outR = out[1];
+        const n = outL.length;
+
+        if (this.available >= n) {
+          for (let i = 0; i < n; i++) {
+            outL[i] = this.bufL[this.readPos];
+            outR[i] = this.bufR[this.readPos];
+            this.readPos = (this.readPos + 1) % this.capacity;
+          }
+          this.available -= n;
+        } else {
+          outL.fill(0);
+          outR.fill(0);
+          this.available = 0;
+        }
+        return true;
+      }
+    }
+    registerProcessor("hyper-audio-processor", HyperAudioProcessor);
+  `;
+
+  async function initAudioContext() {
+    if (audioCtx) return audioCtx;
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return null;
+
+    try {
+      audioCtx = new AudioContextClass({ latencyHint: "interactive", sampleRate: 48000 });
+      gainNode = audioCtx.createGain();
+      gainNode.gain.setValueAtTime(isAudioMuted ? 0 : audioVolume, audioCtx.currentTime);
+      gainNode.connect(audioCtx.destination);
+
+      if ("audioWorklet" in audioCtx && !audioWorkletNode && !isWorkletInitializing) {
+        isWorkletInitializing = true;
+        const blob = new Blob([workletProcessorCode], { type: "application/javascript" });
+        const blobUrl = URL.createObjectURL(blob);
+        audioCtx.audioWorklet.addModule(blobUrl)
+          .then(() => {
+            URL.revokeObjectURL(blobUrl);
+            audioWorkletNode = new AudioWorkletNode(audioCtx, "hyper-audio-processor", {
+              outputChannelCount: [2],
+            });
+            audioWorkletNode.connect(gainNode);
+            console.log("[HyperAudio] Low-Latency AudioWorklet gaming engine active (<15ms)!");
+          })
+          .catch((err) => {
+            console.warn("[HyperAudio] Worklet load error, using fast fallback:", err);
+            audioWorkletNode = null;
+          })
+          .finally(() => {
+            isWorkletInitializing = false;
+          });
+      }
+    } catch (_) {}
+    return audioCtx;
+  }
+
+  function ensureAudioRunning() {
+    initAudioContext();
+    if (audioCtx && audioCtx.state === "suspended") {
+      audioCtx.resume().then(() => {
+        nextAudioPlayTime = audioCtx.currentTime + 0.01;
+      }).catch(() => {});
+    }
+  }
+
+  function updateAudioUI() {
+    const volPercent = Math.round(audioVolume * 100);
+    if (lblVolumeVal) lblVolumeVal.textContent = `${volPercent}%`;
+    if (sliderVolume) sliderVolume.value = volPercent;
+
+    if (isAudioMuted || audioVolume === 0) {
+      if (hudAudioStatus) {
+        hudAudioStatus.textContent = "🔇 TẮT";
+        hudAudioStatus.className = "highlight-gray";
+      }
+      if (btnToggleAudio) btnToggleAudio.textContent = "🔇 Đã tắt tiếng (M)";
+      if (btnFloatAudio) btnFloatAudio.textContent = "🔇 Bật tiếng (M)";
+    } else {
+      if (hudAudioStatus) {
+        hudAudioStatus.textContent = `🔊 ${volPercent}%`;
+        hudAudioStatus.className = "highlight-cyan";
+      }
+      if (btnToggleAudio) btnToggleAudio.textContent = "🔊 Đang bật (M)";
+      if (btnFloatAudio) btnFloatAudio.textContent = "🔊 Tắt tiếng (M)";
+    }
+  }
+
+  function toggleAudioMute() {
+    ensureAudioRunning();
+    isAudioMuted = !isAudioMuted;
+    if (gainNode && audioCtx) {
+      gainNode.gain.setValueAtTime(isAudioMuted ? 0 : audioVolume, audioCtx.currentTime);
+    }
+    updateAudioUI();
+    setToast(isAudioMuted ? "Đã tắt âm thanh máy khách (Muted)." : `Đã bật âm thanh máy khách (${Math.round(audioVolume * 100)}%).`);
+  }
+
+  function setAudioVolume(volPercent) {
+    ensureAudioRunning();
+    audioVolume = Math.max(0, Math.min(100, volPercent)) / 100;
+    if (audioVolume > 0) {
+      isAudioMuted = false;
+    }
+    if (gainNode && audioCtx) {
+      gainNode.gain.setValueAtTime(isAudioMuted ? 0 : audioVolume, audioCtx.currentTime);
+    }
+    updateAudioUI();
+  }
+
+  function handleAudioPacket(view, arrayBuffer) {
+    const sampleRate = view.getUint32(10, false) || 48000;
+    const payloadOffset = 14;
+    const payloadByteLen = arrayBuffer.byteLength - payloadOffset;
+    if (payloadByteLen < 4) return;
+
+    if (!audioCtx) initAudioContext();
+    if (!audioCtx || audioCtx.state !== "running") return;
+
+    // 16-bit PCM stereo (Little Endian): 4 bytes per frame (2 bytes Left, 2 bytes Right)
+    const numFrames = Math.floor(payloadByteLen / 4);
+    if (numFrames === 0) return;
+
+    const int16 = new Int16Array(arrayBuffer, payloadOffset, numFrames * 2);
+    const left = new Float32Array(numFrames);
+    const right = new Float32Array(numFrames);
+
+    for (let i = 0; i < numFrames; i++) {
+      left[i] = int16[i * 2] / 32768.0;
+      right[i] = int16[i * 2 + 1] / 32768.0;
+    }
+
+    if (audioWorkletNode) {
+      audioWorkletNode.port.postMessage({ left, right }, [left.buffer, right.buffer]);
+    } else {
+      // Ultra-Low-Latency Fallback (Locked to 10-25ms)
+      const audioBuf = audioCtx.createBuffer(2, numFrames, sampleRate);
+      audioBuf.copyToChannel(left, 0);
+      audioBuf.copyToChannel(right, 1);
+
+      const now = audioCtx.currentTime;
+      const TARGET_LATENCY_SEC = 0.010; // 10ms target
+      if (nextAudioPlayTime < now || nextAudioPlayTime > now + 0.025) {
+        nextAudioPlayTime = now + TARGET_LATENCY_SEC;
+      }
+
+      const source = audioCtx.createBufferSource();
+      source.buffer = audioBuf;
+      source.connect(gainNode);
+      source.start(nextAudioPlayTime);
+
+      nextAudioPlayTime += audioBuf.duration;
+    }
+  }
+
   let videoDecoder = null;
   let activeCodecId = 0;
   let detectedSpsCodecString = "avc1.42e01f";
@@ -374,11 +581,16 @@
   function handleBinaryVideoPacket(arrayBuffer) {
     if (arrayBuffer.byteLength <= 14) return;
     const view = new DataView(arrayBuffer);
-    const frameType = view.getUint8(0); // 1=Config, 2=Keyframe, 3=Normal, 5=Universal JPEG
+    const frameType = view.getUint8(0); // 1=Config, 2=Keyframe, 3=Normal, 5=Universal JPEG, 6=Audio
     const codecId = view.getUint8(1); // 1=H264, 2=H265
     const ptsUs = Number(view.getBigInt64(2, false));
     const encodeDurationUs = view.getUint32(10, false);
     const payloadBytes = new Uint8Array(arrayBuffer, 14);
+
+    if (frameType === 6) {
+      handleAudioPacket(view, arrayBuffer);
+      return;
+    }
 
     if (frameType === 5) {
       byteCountWindow += payloadBytes.byteLength;
@@ -638,7 +850,10 @@
 
   viewportContainer.addEventListener("dblclick", toggleTrueFullscreen);
 
+  window.addEventListener("click", ensureAudioRunning, { passive: true });
+
   window.addEventListener("keydown", (e) => {
+    ensureAudioRunning();
     if (e.target && e.target.tagName === "INPUT") return;
     const key = e.key.toLowerCase();
     if (key === "c") {
@@ -647,6 +862,8 @@
       rotateCanvas90();
     } else if (key === "z") {
       cycleScaleMode();
+    } else if (key === "m") {
+      toggleAudioMute();
     } else if (key === "f" || e.key === "F11") {
       e.preventDefault();
       toggleTrueFullscreen();
@@ -654,6 +871,16 @@
       document.body.classList.toggle("cinema-mode");
     }
   });
+
+  if (hudAudioMetric) hudAudioMetric.addEventListener("click", toggleAudioMute);
+  if (btnToggleAudio) btnToggleAudio.addEventListener("click", toggleAudioMute);
+  if (btnFloatAudio) btnFloatAudio.addEventListener("click", toggleAudioMute);
+  if (sliderVolume) {
+    sliderVolume.addEventListener("input", (e) => {
+      setAudioVolume(Number(e.target.value));
+    });
+  }
+  updateAudioUI();
 
   btnNativeFfplay.addEventListener("click", async () => {
     const res = await fetch("/api/ffplay", { method: "POST" });

@@ -94,6 +94,7 @@ const FRAME_TYPE_KEYFRAME = 0x02;
 const FRAME_TYPE_NORMAL = 0x03;
 const FRAME_TYPE_PING = 0x04;
 const FRAME_TYPE_JPEG = 0x05;
+const FRAME_TYPE_AUDIO = 0x06;
 
 const CMD_REQUEST_IDR = 0x10;
 const CMD_SET_BITRATE = 0x11;
@@ -395,7 +396,15 @@ function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
       const encodeDurationUs = rxBuffer.readUInt32BE(9);
       const payloadLen = rxBuffer.readUInt32BE(13);
 
-      if (payloadLen > 16 * 1024 * 1024 || frameType < 1 || frameType > 4) {
+      const validTypes = [
+        FRAME_TYPE_CONFIG,
+        FRAME_TYPE_KEYFRAME,
+        FRAME_TYPE_NORMAL,
+        FRAME_TYPE_PING,
+        FRAME_TYPE_AUDIO,
+      ];
+
+      if (payloadLen > 16 * 1024 * 1024 || !validTypes.includes(frameType)) {
         console.warn(`[GMIR] Invalid frame header (type=${frameType}, len=${payloadLen}), resyncing`);
         rxBuffer = Buffer.alloc(0);
         sendCommandToPhone(CMD_REQUEST_IDR);
@@ -413,6 +422,12 @@ function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
         if (payload.length >= 8) {
           sendCommandToPhone(CMD_PONG, payload.subarray(0, 8));
         }
+        continue;
+      }
+
+      if (frameType === FRAME_TYPE_AUDIO) {
+        // encodeDurationUs carries sampleRate (e.g. 48000)
+        broadcastBinaryVideoFrame(FRAME_TYPE_AUDIO, 1, ptsUs, encodeDurationUs, payload);
         continue;
       }
 
