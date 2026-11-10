@@ -30,6 +30,8 @@ Hệ thống gồm **cặp ứng dụng riêng biệt (Android Native Sender + P
 - `android-sender/`: Dự án Android Studio hoàn chỉnh viết bằng Kotlin (`minSdk 26`, `targetSdk 34`).
 - `start-pc-receiver.bat`: Khởi chạy nhanh PC Receiver Control Center tại `http://localhost:3080`.
 - `usb-connect.bat`: Thiết lập nhanh kết nối dây cáp USB qua ADB.
+- `debug-logs.bat`: Công cụ tự động chẩn đoán lỗi USB/ADB, cổng mạng và trích xuất nhật ký stream trực tiếp.
+- `logs/`: Thư mục chứa toàn bộ nhật ký phiên kết nối và file `latest.log`.
 
 ---
 
@@ -56,3 +58,22 @@ Sau đó mở trình duyệt Chrome / Edge tại địa chỉ: `http://localhost
 - **Cách B — Kết nối qua Wi-Fi 5GHz/6GHz**:
   1. Xem địa chỉ **IP Wi-Fi PC** hiển thị trên giao diện PC Receiver (ví dụ `192.168.1.100`).
   2. Trên App Android, chọn **"Wi-Fi 5GHz"**, nhập IP của PC (`192.168.1.100`), chọn **60/90/120 FPS**, **H.265 (HEVC)** hoặc **H.264**, rồi bấm **"BẮT ĐẦU CHIẾU MÀN HÌNH"**.
+
+---
+
+## 4. Kiểm Tra Nhật Ký & Tự Động Chẩn Đoán (Self-Debug)
+
+- **Xem trực tiếp trên giao diện Web**:
+  Bấm nút **"📋 Xem Nhật Ký / Logs Trực Tiếp (Debug)"** tại `http://localhost:3080` để xem ngay các sự kiện âm thanh/hình ảnh, kết nối WebAudio và cảnh báo hệ thống.
+- **Tự động quét lỗi qua Command Line**:
+  Nhấp đúp vào `debug-logs.bat` hoặc chạy:
+  ```powershell
+  node scripts/debug-status.js
+  ```
+  Công cụ sẽ kiểm tra ngay:
+  1. Kết nối cáp USB ADB của điện thoại.
+  2. Cấu hình cổng ADB Reverse và Forward.
+  3. Trạng thái hoạt động của máy chủ PC và WebSocket.
+  4. Trích xuất 25 dòng nhật ký mới nhất từ `logs/latest.log` bao gồm tốc độ âm thanh (pkts/s), video FPS và cảnh báo rớt gói.
+  5. Kiểm tra trực tiếp logcat của hệ điều hành Android (AudioRecord / MediaProjection).
+

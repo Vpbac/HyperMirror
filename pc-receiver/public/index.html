@@ -101,6 +101,9 @@
         <button id="btnSimulator" class="btn btn-sim">
           🎮 Chạy Luồng Giả Lập 60FPS H.264 (Test Ngay Trên PC)
         </button>
+        <button id="btnViewLogs" class="btn btn-secondary" style="margin-top: 8px;">
+          📋 Xem Nhật Ký / Logs Trực Tiếp (Debug)
+        </button>
       </section>
     </aside>
 
@@ -178,6 +181,21 @@
         </div>
       </div>
     </main>
+    <!-- Log Viewer Modal -->
+    <div id="logModal" class="modal-backdrop" style="display: none;">
+      <div class="modal-box">
+        <div class="modal-header">
+          <h3>📋 Nhật Ký Hoạt Động (HyperMirror Logs)</h3>
+          <div class="modal-actions">
+            <button id="btnRefreshLogs" class="btn btn-secondary btn-sm">🔄 Tải lại</button>
+            <button id="btnCloseLogs" class="btn btn-outline btn-sm">✕ Đóng</button>
+          </div>
+        </div>
+        <div class="modal-body">
+          <pre id="logContent">Đang tải nhật ký...</pre>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script src="/app.js"></script>

@@ -40,6 +40,13 @@
   const btnSimulator = document.getElementById("btnSimulator");
   const viewportContainer = document.getElementById("viewportContainer");
 
+  // Log Modal Elements
+  const btnViewLogs = document.getElementById("btnViewLogs");
+  const logModal = document.getElementById("logModal");
+  const btnRefreshLogs = document.getElementById("btnRefreshLogs");
+  const btnCloseLogs = document.getElementById("btnCloseLogs");
+  const logContent = document.getElementById("logContent");
+
   // Audio Controls & Telemetry
   const hudAudioMetric = document.getElementById("hudAudioMetric");
   const hudAudioStatus = document.getElementById("hudAudioStatus");
@@ -55,6 +62,18 @@
   let isAudioMuted = false;
   let audioVolume = 1.0;
   let nextAudioPlayTime = 0;
+  let clientLogStreak = 0;
+
+  function reportClientLog(level, message) {
+    if (clientLogStreak++ > 300) return;
+    try {
+      fetch("/api/client-log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ level, message }),
+      }).catch(() => {});
+    } catch (_) {}
+  }
 
   const workletProcessorCode = `
     class HyperAudioProcessor extends AudioWorkletProcessor {
@@ -66,9 +85,9 @@
         this.writePos = 0;
         this.readPos = 0;
         this.available = 0;
-        // Strict Zero-Latency Target for Competitive Gaming (Wuwa / Lien Quan / Vuong Gia)
-        this.targetSamples = 480;  // 10ms buffer @ 48kHz
-        this.maxSamples = 720;     // 15ms maximum clamp
+        // 25ms Target Jitter Buffer for Silky-Smooth Ultra-Low-Latency Gaming Sound
+        this.targetSamples = 1200; // 25ms @ 48kHz
+        this.maxSamples = 2400;    // 50ms Maximum Latency Clamp
 
         this.port.onmessage = (e) => {
           const { left, right } = e.data;
@@ -80,7 +99,7 @@
           }
           this.available += len;
 
-          // Latency Clamp: if audio backlog builds up beyond 15ms, immediately advance read pointer to 10ms!
+          // Latency Clamp: if audio backlog builds up beyond 50ms, gently clamp to 25ms!
           if (this.available > this.maxSamples) {
             const skip = this.available - this.targetSamples;
             this.readPos = (this.readPos + skip) % this.capacity;
@@ -93,20 +112,18 @@
         const out = outputs[0];
         const outL = out[0];
         const outR = out[1];
-        const n = outL.length;
+        const n = outL.length; // 128 samples
 
-        const samplesToRead = Math.min(this.available, n);
-        for (let i = 0; i < samplesToRead; i++) {
+        // Drain up to n samples from ring buffer with exact fractional preservation
+        const toCopy = Math.min(this.available, n);
+        for (let i = 0; i < toCopy; i++) {
           outL[i] = this.bufL[this.readPos];
           outR[i] = this.bufR[this.readPos];
           this.readPos = (this.readPos + 1) % this.capacity;
         }
-        // Audio packets are 480 samples (10 ms), while browsers usually render
-        // 128-sample quanta. Keep the tail for the next quantum instead of
-        // discarding it whenever fewer than n samples are queued.
-        outL.fill(0, samplesToRead);
-        outR.fill(0, samplesToRead);
-        this.available -= samplesToRead;
+        outL.fill(0, toCopy);
+        outR.fill(0, toCopy);
+        this.available -= toCopy;
         return true;
       }
     }
@@ -123,6 +140,7 @@
       gainNode = audioCtx.createGain();
       gainNode.gain.setValueAtTime(isAudioMuted ? 0 : audioVolume, audioCtx.currentTime);
       gainNode.connect(audioCtx.destination);
+      reportClientLog("INFO", `WebAudio AudioContext created (state=${audioCtx.state}, sampleRate=${audioCtx.sampleRate})`);
 
       if ("audioWorklet" in audioCtx && !audioWorkletNode && !isWorkletInitializing) {
         isWorkletInitializing = true;
@@ -135,17 +153,19 @@
               outputChannelCount: [2],
             });
             audioWorkletNode.connect(gainNode);
-            console.log("[HyperAudio] Low-Latency AudioWorklet gaming engine active (<15ms)!");
+            reportClientLog("INFO", "AudioWorklet Zero-Latency Engine activated (<25ms jitter buffer)");
           })
           .catch((err) => {
-            console.warn("[HyperAudio] Worklet load error, using fast fallback:", err);
+            reportClientLog("WARN", `AudioWorklet addModule error: ${err.message}, using fallback`);
             audioWorkletNode = null;
           })
           .finally(() => {
             isWorkletInitializing = false;
           });
       }
-    } catch (_) {}
+    } catch (e) {
+      reportClientLog("ERROR", `Failed creating AudioContext: ${e.message}`);
+    }
     return audioCtx;
   }
 
@@ -153,8 +173,12 @@
     initAudioContext();
     if (audioCtx && audioCtx.state === "suspended") {
       audioCtx.resume().then(() => {
-        nextAudioPlayTime = audioCtx.currentTime + 0.01;
-      }).catch(() => {});
+        reportClientLog("INFO", "AudioContext resumed to RUNNING state via user gesture");
+        nextAudioPlayTime = audioCtx.currentTime + 0.02;
+        updateAudioUI();
+      }).catch((e) => {
+        reportClientLog("WARN", `AudioContext resume failed: ${e.message}`);
+      });
     }
   }
 
@@ -170,6 +194,13 @@
       }
       if (btnToggleAudio) btnToggleAudio.textContent = "🔇 Đã tắt tiếng (M)";
       if (btnFloatAudio) btnFloatAudio.textContent = "🔇 Bật tiếng (M)";
+    } else if (audioCtx && audioCtx.state === "suspended") {
+      if (hudAudioStatus) {
+        hudAudioStatus.textContent = "🔇 CLICK ĐỂ BẬT";
+        hudAudioStatus.className = "highlight-yellow";
+      }
+      if (btnToggleAudio) btnToggleAudio.textContent = "🔇 Click bật tiếng (M)";
+      if (btnFloatAudio) btnFloatAudio.textContent = "🔇 Click bật tiếng (M)";
     } else {
       if (hudAudioStatus) {
         hudAudioStatus.textContent = `🔊 ${volPercent}%`;
@@ -209,7 +240,10 @@
     if (payloadByteLen < 4) return;
 
     if (!audioCtx) initAudioContext();
-    if (!audioCtx || audioCtx.state !== "running") return;
+    if (!audioCtx || audioCtx.state !== "running") {
+      updateAudioUI();
+      return;
+    }
 
     // 16-bit PCM stereo (Little Endian): 4 bytes per frame (2 bytes Left, 2 bytes Right)
     const numFrames = Math.floor(payloadByteLen / 4);
@@ -227,14 +261,14 @@
     if (audioWorkletNode) {
       audioWorkletNode.port.postMessage({ left, right }, [left.buffer, right.buffer]);
     } else {
-      // Ultra-Low-Latency Fallback (Locked to 10-25ms)
+      // Ultra-Low-Latency Fallback (Locked to 20-50ms)
       const audioBuf = audioCtx.createBuffer(2, numFrames, sampleRate);
       audioBuf.copyToChannel(left, 0);
       audioBuf.copyToChannel(right, 1);
 
       const now = audioCtx.currentTime;
-      const TARGET_LATENCY_SEC = 0.010; // 10ms target
-      if (nextAudioPlayTime < now || nextAudioPlayTime > now + 0.025) {
+      const TARGET_LATENCY_SEC = 0.025; // 25ms target
+      if (nextAudioPlayTime < now || nextAudioPlayTime > now + 0.060) {
         nextAudioPlayTime = now + TARGET_LATENCY_SEC;
       }
 
@@ -912,6 +946,47 @@
         : "Đã dừng luồng giả lập."
     );
   });
+
+  async function fetchAndRenderLogs() {
+    if (!logContent) return;
+    try {
+      const res = await fetch("/api/logs");
+      const data = await res.json();
+      if (data && data.lines && Array.isArray(data.lines)) {
+        logContent.textContent = data.lines.join("\n") || "(Chưa có dữ liệu nhật ký)";
+      } else {
+        logContent.textContent = (data && data.content) || "(Trống)";
+      }
+      logContent.scrollTop = logContent.scrollHeight;
+    } catch (err) {
+      logContent.textContent = `Lỗi khi tải nhật ký: ${err.message}`;
+    }
+  }
+
+  if (btnViewLogs && logModal) {
+    btnViewLogs.addEventListener("click", () => {
+      logModal.style.display = "flex";
+      fetchAndRenderLogs();
+    });
+  }
+
+  if (btnCloseLogs && logModal) {
+    btnCloseLogs.addEventListener("click", () => {
+      logModal.style.display = "none";
+    });
+  }
+
+  if (btnRefreshLogs) {
+    btnRefreshLogs.addEventListener("click", fetchAndRenderLogs);
+  }
+
+  if (logModal) {
+    logModal.addEventListener("click", (e) => {
+      if (e.target === logModal) {
+        logModal.style.display = "none";
+      }
+    });
+  }
 
   loadServerInfo();
   connectWebSocket();

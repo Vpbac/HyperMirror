@@ -82,6 +82,7 @@ class AudioStreamer(
                 Log.i(TAG, "AudioPlaybackCapture active: 48kHz Stereo 16-bit PCM (10ms Gaming Low-Latency)")
 
                 val chunk = ByteArray(FRAME_BYTES)
+                var loggedFirstAudio = false
                 while (isRunning.get()) {
                     var bytesRead = 0
                     while (bytesRead < FRAME_BYTES && isRunning.get()) {
@@ -90,6 +91,7 @@ class AudioStreamer(
                             bytesRead += res
                         } else if (res < 0) {
                             Log.w(TAG, "AudioRecord read error: $res")
+                            Thread.sleep(10)
                             break
                         }
                     }
@@ -98,6 +100,10 @@ class AudioStreamer(
                         val nowUs = System.nanoTime() / 1000L
                         val packet = if (bytesRead == FRAME_BYTES) chunk else chunk.copyOf(bytesRead)
                         transport.sendAudioFrame(nowUs, SAMPLE_RATE, packet)
+                        if (!loggedFirstAudio) {
+                            Log.i(TAG, "First audio frame transmitted to PC ($bytesRead bytes @ 48kHz stereo)")
+                            loggedFirstAudio = true
+                        }
                     }
                 }
             } catch (e: Exception) {

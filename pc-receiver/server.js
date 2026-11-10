@@ -21,6 +21,70 @@ const { spawn, exec, execSync } = require("child_process");
 const STREAM_PORT = Number(process.env.STREAM_PORT || 27183);
 const WEB_PORT = Number(process.env.WEB_PORT || 3080);
 
+// ==========================================
+// Centralized Logging Engine with Dedicated Log Files
+// ==========================================
+const LOGS_DIR = path.join(__dirname, "..", "logs");
+try {
+  if (!fs.existsSync(LOGS_DIR)) {
+    fs.mkdirSync(LOGS_DIR, { recursive: true });
+  }
+} catch (_) {}
+
+const timestampStr = new Date()
+  .toISOString()
+  .replace(/[:.]/g, "-")
+  .replace("T", "_")
+  .replace("Z", "");
+const currentSessionLogPath = path.join(LOGS_DIR, `hypermirror_${timestampStr}.log`);
+const latestLogPath = path.join(LOGS_DIR, "latest.log");
+
+let logStream = null;
+try {
+  logStream = fs.createWriteStream(currentSessionLogPath, { flags: "a" });
+  fs.writeFileSync(
+    latestLogPath,
+    `[${new Date().toISOString()}] [INIT] HyperMirror Pro Session Started\r\n`
+  );
+} catch (e) {
+  process.stderr.write(`Could not initialize file logger: ${e.message}\n`);
+}
+
+function writeToLogFiles(line) {
+  if (logStream && !logStream.destroyed) {
+    try {
+      logStream.write(line + "\r\n");
+    } catch (_) {}
+  }
+  try {
+    fs.appendFileSync(latestLogPath, line + "\r\n");
+  } catch (_) {}
+}
+
+const origLog = console.log;
+const origWarn = console.warn;
+const origError = console.error;
+
+console.log = function (...args) {
+  const line = `[${new Date().toISOString()}] [INFO] ${args.map((a) => (typeof a === "object" ? JSON.stringify(a) : a)).join(" ")}`;
+  origLog.apply(console, args);
+  writeToLogFiles(line);
+};
+
+console.warn = function (...args) {
+  const line = `[${new Date().toISOString()}] [WARN] ${args.map((a) => (typeof a === "object" ? JSON.stringify(a) : a)).join(" ")}`;
+  origWarn.apply(console, args);
+  writeToLogFiles(line);
+};
+
+console.error = function (...args) {
+  const line = `[${new Date().toISOString()}] [ERROR] ${args.map((a) => (typeof a === "object" ? JSON.stringify(a) : a)).join(" ")}`;
+  origError.apply(console, args);
+  writeToLogFiles(line);
+};
+
+console.log(`[Logging Engine] Session log initialized: ${currentSessionLogPath}`);
+
 // Global crash protection so child_process or socket errors never terminate the server
 process.on("uncaughtException", (err) => {
   console.warn(`[SafeGuard] Ignored non-fatal exception: ${err.message}`);
@@ -118,6 +182,32 @@ let ffplayProcess = null;
 let universalDecoderProcess = null;
 let simulatorProcess = null;
 let simulatorSocket = null;
+
+// Audio & Video Realtime Telemetry Tracking
+let audioPacketsReceived = 0;
+let audioBytesReceived = 0;
+let lastAudioLogTime = Date.now();
+let videoFramesReceived = 0;
+
+setInterval(() => {
+  if (!streamMeta.connected) return;
+  const now = Date.now();
+  const elapsedSec = (now - lastAudioLogTime) / 1000;
+  if (elapsedSec >= 5) {
+    const pps = (audioPacketsReceived / elapsedSec).toFixed(1);
+    const kbps = ((audioBytesReceived * 8) / elapsedSec / 1000).toFixed(1);
+    const fps = (videoFramesReceived / elapsedSec).toFixed(1);
+    if (audioPacketsReceived > 0) {
+      console.log(`[Audio Telemetry] Audio: ${pps} pkts/s (${kbps} kbps) | Video: ${fps} FPS | Status: HEALTHY`);
+    } else if (videoFramesReceived > 20) {
+      console.warn(`[Audio Telemetry Alert] Video active (${fps} FPS) BUT 0 audio packets received in last ${elapsedSec.toFixed(0)}s! Check phone media volume or permissions.`);
+    }
+    audioPacketsReceived = 0;
+    audioBytesReceived = 0;
+    videoFramesReceived = 0;
+    lastAudioLogTime = now;
+  }
+}, 5000);
 
 const wsClients = new Set();
 
@@ -427,9 +517,13 @@ function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
 
       if (frameType === FRAME_TYPE_AUDIO) {
         // encodeDurationUs carries sampleRate (e.g. 48000)
+        audioPacketsReceived++;
+        audioBytesReceived += payload.length;
         broadcastBinaryVideoFrame(FRAME_TYPE_AUDIO, 1, ptsUs, encodeDurationUs, payload);
         continue;
       }
+
+      videoFramesReceived++;
 
       if (frameType === FRAME_TYPE_CONFIG) {
         cachedConfigFrame = payload;
@@ -810,8 +904,45 @@ const httpServer = http.createServer(async (req, res) => {
         meta: streamMeta,
         ffplayActive: Boolean(ffplayProcess),
         simulatorActive: Boolean(simulatorProcess),
+        logFile: latestLogPath,
       })
     );
+    return;
+  }
+
+  if (url.pathname === "/api/logs" && req.method === "GET") {
+    try {
+      const content = fs.existsSync(latestLogPath)
+        ? fs.readFileSync(latestLogPath, "utf8")
+        : "Chưa có log.";
+      const lines = content.trim().split(/\r?\n/).slice(-150);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          file: latestLogPath,
+          sessionFile: currentSessionLogPath,
+          lines,
+        })
+      );
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: err.message }));
+    }
+    return;
+  }
+
+  if (url.pathname === "/api/client-log" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      try {
+        const { level = "INFO", message = "" } = JSON.parse(body || "{}");
+        console.log(`[Browser Client] [${level}] ${message}`);
+      } catch (_) {}
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
     return;
   }
 
