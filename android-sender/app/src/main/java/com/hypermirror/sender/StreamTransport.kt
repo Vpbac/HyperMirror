@@ -128,10 +128,14 @@ class StreamTransport(
         Thread({
             val targets = mutableListOf<String>()
             val trimmedHost = config.targetHost.trim()
-            if (trimmedHost.isNotEmpty() && trimmedHost != "127.0.0.1") {
-                targets.add(trimmedHost)
+            if (config.transportMode == TransportMode.USB_SERVER) {
+                targets.add("127.0.0.1")
+            } else {
+                if (trimmedHost.isNotEmpty() && trimmedHost != "127.0.0.1") {
+                    targets.add(trimmedHost)
+                }
+                targets.add("127.0.0.1")
             }
-            targets.add("127.0.0.1")
 
             var idx = 0
             var udpSock: DatagramSocket? = null

@@ -164,6 +164,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupUiListeners() {
+        binding.rbUsbServer.setOnCheckedChangeListener { _, isChecked ->
+            if (isChecked) {
+                binding.etTargetIp.setText("127.0.0.1")
+            }
+        }
+        binding.rbWifiClient.setOnCheckedChangeListener { _, isChecked ->
+            if (isChecked) {
+                val savedIp = getSharedPreferences("hypermirror_prefs", Context.MODE_PRIVATE)
+                    .getString("last_pc_ip", "") ?: ""
+                if (savedIp.isNotEmpty() && savedIp != "127.0.0.1") {
+                    binding.etTargetIp.setText(savedIp)
+                }
+            }
+        }
+
         binding.sbBitrate.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                 val mbps = progress.coerceAtLeast(2)
@@ -291,7 +306,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         val bitrateMbps = binding.sbBitrate.progress.coerceAtLeast(2)
-        val targetIp = binding.etTargetIp.text.toString().trim().ifEmpty { "127.0.0.1" }
+        val targetIp = if (transportMode == TransportMode.USB_SERVER) {
+            "127.0.0.1"
+        } else {
+            binding.etTargetIp.text.toString().trim().ifEmpty { "127.0.0.1" }
+        }
 
         return MirrorConfig(
             codec = codec,

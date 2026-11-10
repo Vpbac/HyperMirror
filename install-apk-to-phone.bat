@@ -18,8 +18,8 @@ echo Installing "%APK_PATH%" to your Android device...
 "%ADB_EXE%" install -r "%APK_PATH%"
 echo.
 echo Setting up USB Low-Latency Tunnel...
-"%ADB_EXE%" forward tcp:27184 tcp:27183
 "%ADB_EXE%" reverse tcp:27183 tcp:27183
+"%ADB_EXE%" forward tcp:27184 tcp:27184
 echo.
 echo Done! Open "HyperMirror Pro" on your phone to start mirroring.
 pause

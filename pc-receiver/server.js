@@ -499,9 +499,15 @@ function connectToPhoneServer(host = "127.0.0.1", port = STREAM_PORT, label = "U
       resolve("already-connected");
       return;
     }
+
+    // Never connect to our own TCP server on port 27183
+    if ((host === "127.0.0.1" || host === "localhost") && port === STREAM_PORT) {
+      reject(new Error("Cannot connect to local listening port (27183)"));
+      return;
+    }
+
     const client = new net.Socket();
     let settled = false;
-    let gotData = false;
 
     // Never let an HTTP request hang forever if a TCP endpoint accepts but
     // never sends the GMIR handshake (e.g. wrong port / adb forward without app).
@@ -521,18 +527,8 @@ function connectToPhoneServer(host = "127.0.0.1", port = STREAM_PORT, label = "U
       }
     }
 
-    client.setTimeout(1500);
     client.connect(port, host, () => {
-      client.setTimeout(0);
-      const loopbackTimer = setTimeout(() => {
-        if (!gotData && host === "127.0.0.1") {
-          finish(new Error("Loopback self-connection ignored"));
-        }
-      }, 600);
-
       client.once("data", (firstChunk) => {
-        gotData = true;
-        clearTimeout(loopbackTimer);
         attachPhoneStreamSocket(client, label);
         client.emit("data", firstChunk);
         finish();
@@ -771,30 +767,31 @@ function toggleBuiltInSimulator(fps = 60, bitrateMbps = 12) {
 function setupUsbAdbTunnel() {
   return new Promise((resolve) => {
     exec(
-      `${ADB_CMD} forward tcp:27184 tcp:27184 && ${ADB_CMD} reverse tcp:${STREAM_PORT} tcp:${STREAM_PORT}`,
+      `${ADB_CMD} reverse tcp:${STREAM_PORT} tcp:${STREAM_PORT} && ${ADB_CMD} forward tcp:27184 tcp:27184`,
       (err, stdout, stderr) => {
         if (err) {
           resolve({
             ok: false,
             message:
-              "Không tìm thấy thiết bị ADB hoặc chưa bật USB Debugging. Bạn vẫn có thể kết nối qua Wi-Fi IP!",
+              "Không tìm thấy thiết bị ADB hoặc chưa bật USB Debugging. Hãy cắm lại cáp và bật USB Debugging trên điện thoại!",
             details: stderr || err.message,
           });
-        } else {
-          connectToPhoneServer("127.0.0.1", 27184, "USB Cable (ADB Forward)")
-            .then(() => {
-              resolve({
-                ok: true,
-                message: `Đã kết nối thành công qua cáp USB và bắt đầu nhận luồng hình ảnh!`,
-              });
-            })
-            .catch(() => {
-              resolve({
-                ok: true,
-                message: `Đã mở đường hầm cáp USB (adb forward & reverse). Hãy bấm 'Bắt đầu chiếu' trên điện thoại!`,
-              });
-            });
+          return;
         }
+
+        connectToPhoneServer("127.0.0.1", 27184, "USB Cable (ADB Forward)")
+          .then(() => {
+            resolve({
+              ok: true,
+              message: `Đã kết nối thành công qua cáp USB và bắt đầu nhận luồng hình ảnh!`,
+            });
+          })
+          .catch(() => {
+            resolve({
+              ok: true,
+              message: `Đã thiết lập đường hầm USB (ADB Reverse & Forward)! Hãy bấm 'BẮT ĐẦU CHIẾU MÀN HÌNH' trên điện thoại.`,
+            });
+          });
       }
     );
   });
