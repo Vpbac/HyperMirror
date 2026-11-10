@@ -51,6 +51,9 @@ jobs:
           name: HyperMirrorSender-debug-apk
           path: dist
 
+      - name: Rename APK for release
+        run: mv dist/app-debug.apk dist/HyperMirrorSender-debug.apk
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -59,4 +62,4 @@ jobs:
           body_path: CHANGELOG.md
           draft: false
           prerelease: false
-          files: dist/app-debug.apk
+          files: dist/HyperMirrorSender-debug.apk
