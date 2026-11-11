@@ -38,7 +38,7 @@ data class MirrorConfig(
     val targetHost: String = "192.168.1.10",
     val targetPort: Int = 27183,
     val maxDimension: Int = 1920,     // 1280 (720p), 1920 (1080p), 2560 (1440p), 0 (Native)
-    val fps: Int = 60,                // 60, 90, 120 FPS
+    val fps: Int = 60,                // 60, 90, 120, 144 FPS
     val bitrateMbps: Int = 16,        // 4 - 40 Mbps
     val intraRefreshSec: Int = 1,
     val ultraLowLatencyMode: Boolean = true

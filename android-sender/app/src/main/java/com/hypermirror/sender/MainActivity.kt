@@ -80,6 +80,9 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        // Switch Poco X8 Pro AMOLED display to 120Hz/144Hz high refresh rate
+        BatteryOptimizationHelper.requestDisplayHighRefreshRate(window)
+
         val phoneIp = getDeviceWifiIp()
         binding.tvDeviceIp.text = "IP Điện thoại: $phoneIp • Tự động tìm PC trên Wi-Fi"
 
@@ -95,6 +98,11 @@ class MainActivity : AppCompatActivity() {
         setupUiListeners()
         observeTelemetry()
         startPcUdpDiscovery()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshBatteryOptimizationUi()
     }
 
     override fun onStart() {
@@ -115,6 +123,23 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         discoveryActive.set(false)
         super.onDestroy()
+    }
+
+    private fun refreshBatteryOptimizationUi() {
+        val isIgnoring = BatteryOptimizationHelper.isIgnoringBatteryOptimizations(this)
+        if (isIgnoring) {
+            binding.tvBatteryStatus.text = "✓ Trạng thái: Không hạn chế nền (Đã tối ưu cho HyperOS)"
+            binding.tvBatteryStatus.setTextColor(ContextCompat.getColor(this, R.color.accent_green))
+            binding.btnIgnoreBatteryOpt.text = if (BatteryOptimizationHelper.isXiaomiOrPocoDevice()) {
+                "MỞ CÀI ĐẶT TỰ KHỞI CHẠY (HYPEROS AUTOSTART)"
+            } else {
+                "ĐÃ BỎ QUA TỐI ƯU HÓA PIN"
+            }
+        } else {
+            binding.tvBatteryStatus.text = "⚠️ HyperOS có thể đóng ứng dụng khi chạy game nặng (Wuwa / Vinh Diệu / Liên Quân)"
+            binding.tvBatteryStatus.setTextColor(ContextCompat.getColor(this, R.color.accent_red))
+            binding.btnIgnoreBatteryOpt.text = "TẮT TỐI ƯU PIN (KHÔNG HẠN CHẾ NỀN)"
+        }
     }
 
     /**
@@ -192,6 +217,16 @@ class MainActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(seekBar: SeekBar?) {}
         })
 
+        binding.btnIgnoreBatteryOpt.setOnClickListener {
+            if (!BatteryOptimizationHelper.isIgnoringBatteryOptimizations(this)) {
+                BatteryOptimizationHelper.requestIgnoreBatteryOptimizations(this)
+            } else if (BatteryOptimizationHelper.isXiaomiOrPocoDevice()) {
+                BatteryOptimizationHelper.openXiaomiBackgroundSettings(this)
+            } else {
+                Toast.makeText(this, "Đã cho phép chạy nền không giới hạn", Toast.LENGTH_SHORT).show()
+            }
+        }
+
         binding.btnToggleMirror.setOnClickListener {
             if (MirrorForegroundService.isRunningFlow.value) {
                 val stopIntent = Intent(this, MirrorForegroundService::class.java).apply {
@@ -216,6 +251,11 @@ class MainActivity : AppCompatActivity() {
                 .edit()
                 .putString("last_pc_ip", targetIp)
                 .apply()
+        }
+
+        // Proactively request battery optimization ignore on Xiaomi / HyperOS
+        if (!BatteryOptimizationHelper.isIgnoringBatteryOptimizations(this)) {
+            BatteryOptimizationHelper.requestIgnoreBatteryOptimizations(this)
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
@@ -293,6 +333,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val fps = when {
+            binding.rbFps144.isChecked -> 144
             binding.rbFps120.isChecked -> 120
             binding.rbFps90.isChecked -> 90
             else -> 60

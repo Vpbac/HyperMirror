@@ -57,10 +57,23 @@ class MirrorForegroundService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+    }
+
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
+        if (intent == null) {
+            if (!_isRunningFlow.value) {
+                stopSafely()
+                return START_NOT_STICKY
+            }
+            return START_STICKY
+        }
+
+        when (intent.action) {
             ACTION_START -> {
                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
                 val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -79,18 +92,30 @@ class MirrorForegroundService : Service() {
                 if (resultData != null && resultCode == Activity.RESULT_OK) {
                     startMirrorSessionSafely(resultCode, resultData, config)
                 } else {
-                    stopSelf()
+                    // Critical for Android 14/15: If started with startForegroundService, we MUST invoke
+                    // startForeground before stopSelf() to prevent ForegroundServiceDidNotStartInTimeException
+                    val notif = buildNotification(config)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        startForeground(
+                            NOTIFICATION_ID,
+                            notif,
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                        )
+                    } else {
+                        startForeground(NOTIFICATION_ID, notif)
+                    }
+                    stopSafely()
                 }
             }
             ACTION_STOP -> {
                 stopMirrorSession()
-                stopSelf()
+                stopSafely()
             }
             else -> {
-                stopSelf()
+                stopSafely()
             }
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     private fun startMirrorSessionSafely(resultCode: Int, resultData: Intent, config: MirrorConfig) {
@@ -99,6 +124,9 @@ class MirrorForegroundService : Service() {
             createNotificationChannel()
             val notification = buildNotification(config)
 
+            // CRITICAL FOR ANDROID 14/15: startForeground with FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            // MUST be invoked BEFORE calling MediaProjectionManager.getMediaProjection().
+            // Otherwise, Android 14 throws a fatal SecurityException!
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(
                     NOTIFICATION_ID,
@@ -109,23 +137,27 @@ class MirrorForegroundService : Service() {
                 startForeground(NOTIFICATION_ID, notification)
             }
 
+            // Counteract Xiaomi HyperOS aggressive background killing with PARTIAL_WAKE_LOCK & LOW_LATENCY Wi-Fi lock
             acquireLowLatencyLocks()
 
             val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             val projection = projectionManager.getMediaProjection(resultCode, resultData)
             if (projection == null) {
-                Log.e(TAG, "MediaProjection returned null")
+                Log.e(TAG, "MediaProjectionManager returned null projection")
                 stopMirrorSession()
-                stopSelf()
+                stopSafely()
                 return
             }
 
+            // Register MediaProjection.Callback before creating VirtualDisplay (Android 14+ strict requirement)
+            val mainHandler = Handler(Looper.getMainLooper())
             projection.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() {
+                    Log.w(TAG, "MediaProjection stopped by OS callback")
                     stopMirrorSession()
-                    stopSelf()
+                    stopSafely()
                 }
-            }, Handler(Looper.getMainLooper()))
+            }, mainHandler)
             mediaProjection = projection
 
             val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -179,15 +211,16 @@ class MirrorForegroundService : Service() {
                     }
                 }
                 _isRunningFlow.value = true
+                Log.i(TAG, "HyperMirror session fully active: ${hwEncoder.encodedWidth}x${hwEncoder.encodedHeight} @ ${config.fps}fps")
             } else {
                 Log.e(TAG, "Hardware encoder failed all configuration tiers")
                 stopMirrorSession()
-                stopSelf()
+                stopSafely()
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error starting mirror session", e)
             stopMirrorSession()
-            stopSelf()
+            stopSafely()
         }
     }
 
@@ -202,23 +235,34 @@ class MirrorForegroundService : Service() {
     private fun acquireLowLatencyLocks() {
         try {
             val pm = applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HyperMirror::GamingEncodeWakeLock").apply {
-                setReferenceCounted(false)
-                acquire(4 * 60 * 60 * 1000L)
+            if (wakeLock == null) {
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HyperMirror::GamingEncodeWakeLock").apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (wakeLock?.isHeld != true) {
+                wakeLock?.acquire(24 * 60 * 60 * 1000L) // 24h lock to prevent HyperOS doze
+                Log.i(TAG, "Acquired PowerManager.PARTIAL_WAKE_LOCK")
             }
 
             val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val wifiLockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-            } else {
-                @Suppress("DEPRECATION")
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            if (wifiLock == null) {
+                val wifiLockMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                wifiLock = wm.createWifiLock(wifiLockMode, "HyperMirror::GamingLowLatencyWifiLock").apply {
+                    setReferenceCounted(false)
+                }
             }
-            wifiLock = wm.createWifiLock(wifiLockMode, "HyperMirror::GamingLowLatencyWifiLock").apply {
-                setReferenceCounted(false)
-                acquire()
+            if (wifiLock?.isHeld != true) {
+                wifiLock?.acquire()
+                Log.i(TAG, "Acquired WifiManager.WIFI_MODE_FULL_LOW_LATENCY")
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not acquire low latency locks: ${e.message}")
         }
     }
 
@@ -262,6 +306,16 @@ class MirrorForegroundService : Service() {
         _telemetryFlow.value = StreamTelemetry()
     }
 
+    private fun stopSafely() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+        stopSelf()
+    }
+
     override fun onDestroy() {
         stopMirrorSession()
         super.onDestroy()
@@ -275,6 +329,7 @@ class MirrorForegroundService : Service() {
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
                 description = "Duy trì kết nối truyền màn hình độ trễ thấp khi đang chơi game"
+                setShowBadge(false)
             }
             val nm = getSystemService(NotificationManager::class.java)
             nm.createNotificationChannel(channel)
@@ -306,6 +361,8 @@ class MirrorForegroundService : Service() {
             .setContentText("Bitrate: ${config.bitrateMbps} Mbps • Zero-Latency Mode Active")
             .setContentIntent(pendingOpen)
             .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .addAction(android.R.drawable.ic_media_pause, "Dừng phát", pendingStop)
             .build()
     }

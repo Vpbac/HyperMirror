@@ -9,6 +9,7 @@
 
     <!-- Keep CPU and Wi-Fi chip in Ultra-Low-Latency Gaming state -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- Audio Recording Permission for Game Audio Playback Capture (Android 10+) -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />

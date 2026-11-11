@@ -37,6 +37,13 @@ class LowLatencyEncoder(
     private var inputSurface: Surface? = null
     private var virtualDisplay: VirtualDisplay? = null
 
+    private val projectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            Log.w(TAG, "MediaProjection session terminated by system or user")
+            stop()
+        }
+    }
+
     var encodedWidth: Int = 1920
         private set
     var encodedHeight: Int = 1080
@@ -78,7 +85,6 @@ class LowLatencyEncoder(
     }
 
     private fun align8(value: Int): Int = max(256, (value / 8) * 8)
-    private fun align16(value: Int): Int = max(256, (value / 16) * 16)
 
     fun start(): Boolean {
         if (isEncoding.getAndSet(true)) return true
@@ -95,6 +101,30 @@ class LowLatencyEncoder(
             inputSurface = surface
             mediaCodec.start()
 
+            // CRITICAL FOR ANDROID 14/15: Register MediaProjection.Callback before calling createVirtualDisplay.
+            // Failure to do so throws IllegalStateException on Android 14+.
+            val mainHandler = Handler(Looper.getMainLooper())
+            try {
+                mediaProjection.registerCallback(projectionCallback, mainHandler)
+            } catch (e: Exception) {
+                Log.w(TAG, "MediaProjection callback registration info: ${e.message}")
+            }
+
+            val virtualDisplayCallback = object : VirtualDisplay.Callback() {
+                override fun onPaused() {
+                    Log.d(TAG, "VirtualDisplay paused")
+                }
+
+                override fun onResumed() {
+                    Log.d(TAG, "VirtualDisplay resumed - requesting instant sync frame")
+                    requestInstantSyncFrame()
+                }
+
+                override fun onStopped() {
+                    Log.d(TAG, "VirtualDisplay stopped")
+                }
+            }
+
             virtualDisplay = mediaProjection.createVirtualDisplay(
                 "HyperMirror-ZeroLatency",
                 encodedWidth,
@@ -102,8 +132,8 @@ class LowLatencyEncoder(
                 displayMetrics.densityDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 surface,
-                null,
-                Handler(Looper.getMainLooper())
+                virtualDisplayCallback,
+                mainHandler
             )
 
             Thread({
@@ -137,27 +167,39 @@ class LowLatencyEncoder(
         val res720H = if (isLandscape) 720 else 1280
 
         for (mime in mimesToTry) {
-            // Tầng 1: Độ phân giải mục tiêu + FPS mục tiêu
-            tryConfigureTier(mime, encodedWidth, encodedHeight, config.fps, useExtendedFlags = true)?.let {
-                Log.i(TAG, "Encoder Tier 1 started: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
+            // Tầng 1: Độ phân giải mục tiêu + FPS (lên tới 120Hz/144Hz) + MTK / Qualcomm Low-Latency + CBR
+            tryConfigureTier(mime, encodedWidth, encodedHeight, config.fps, useExtendedFlags = true, useVendorExtensions = true)?.let {
+                Log.i(TAG, "Encoder Tier 1 (Vendor Low-Latency) active: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
                 return it
             }
 
-            // Tầng 2: Chuẩn 1080p (1920x1080 hoặc 1080x1920) @ 60FPS cho Snapdragon OMX
-            tryConfigureTier(mime, res1080W, res1080H, min(config.fps, 60), useExtendedFlags = false)?.let {
-                Log.i(TAG, "Encoder Tier 2 (1080p@60) started: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
+            // Tầng 1b: Độ phân giải mục tiêu + FPS (lên tới 120Hz/144Hz) + Chuẩn Android Low-Latency
+            tryConfigureTier(mime, encodedWidth, encodedHeight, config.fps, useExtendedFlags = true, useVendorExtensions = false)?.let {
+                Log.i(TAG, "Encoder Tier 1b (Standard Low-Latency) active: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
                 return it
             }
 
-            // Tầng 3: Chuẩn 720p (1280x720 hoặc 720x1280) @ 60FPS
-            tryConfigureTier(mime, res720W, res720H, 60, useExtendedFlags = false)?.let {
-                Log.i(TAG, "Encoder Tier 3 (720p@60) started: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
+            // Tầng 2: Chuẩn 1080p @ target FPS + vendor extensions
+            tryConfigureTier(mime, res1080W, res1080H, config.fps, useExtendedFlags = true, useVendorExtensions = true)?.let {
+                Log.i(TAG, "Encoder Tier 2 (1080p @ ${actualFps}fps) active: $mime")
+                return it
+            }
+
+            // Tầng 2b: Chuẩn 1080p @ 60FPS
+            tryConfigureTier(mime, res1080W, res1080H, min(config.fps, 60), useExtendedFlags = false, useVendorExtensions = false)?.let {
+                Log.i(TAG, "Encoder Tier 2b (1080p@60) active: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
+                return it
+            }
+
+            // Tầng 3: Chuẩn 720p @ 60FPS
+            tryConfigureTier(mime, res720W, res720H, 60, useExtendedFlags = false, useVendorExtensions = false)?.let {
+                Log.i(TAG, "Encoder Tier 3 (720p@60) active: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
                 return it
             }
 
             // Tầng 4: 720p @ 30FPS an toàn tuyệt đối
-            tryConfigureTier(mime, res720W, res720H, 30, useExtendedFlags = false)?.let {
-                Log.i(TAG, "Encoder Tier 4 (720p@30) started: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
+            tryConfigureTier(mime, res720W, res720H, 30, useExtendedFlags = false, useVendorExtensions = false)?.let {
+                Log.i(TAG, "Encoder Tier 4 (720p@30) active: $mime ${encodedWidth}x${encodedHeight} @ ${actualFps}fps")
                 return it
             }
         }
@@ -169,7 +211,8 @@ class LowLatencyEncoder(
         width: Int,
         height: Int,
         fps: Int,
-        useExtendedFlags: Boolean
+        useExtendedFlags: Boolean,
+        useVendorExtensions: Boolean = true
     ): MediaCodec? {
         var mc: MediaCodec? = null
         return try {
@@ -182,6 +225,8 @@ class LowLatencyEncoder(
                 videoCaps.bitrateRange.upper
             )
 
+            // For high refresh rate gaming displays (120Hz/144Hz on Poco X8 Pro),
+            // support target fps up to 144
             val targetFps = if (!useExtendedFlags) {
                 fps.coerceAtMost(60)
             } else {
@@ -191,13 +236,16 @@ class LowLatencyEncoder(
                     } else if (videoCaps.isSizeSupported(height, width)) {
                         videoCaps.getSupportedFrameRatesFor(height, width).upper.toInt()
                     } else {
-                        60
+                        fps
                     }
                 } catch (_: Exception) {
-                    60
+                    fps
                 }
-                fps.coerceIn(30, maxSupported.coerceAtLeast(30))
+                fps.coerceIn(30, maxOf(fps, maxSupported).coerceAtMost(144))
             }
+
+            // Repeat interval matching the target refresh rate (e.g. 6.94ms for 144fps, 8.33ms for 120fps)
+            val repeatIntervalUs = (1_000_000L / targetFps.coerceAtLeast(30)).coerceAtLeast(6_944L)
 
             val format = MediaFormat.createVideoFormat(mime, width, height).apply {
                 setInteger(
@@ -207,7 +255,13 @@ class LowLatencyEncoder(
                 setInteger(MediaFormat.KEY_BIT_RATE, clampedBitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, config.intraRefreshSec)
-                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 16_666L)
+                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, repeatIntervalUs)
+
+                // Constant Bitrate (CBR) for ultra-stable streaming without buffer bloat
+                setInteger(
+                    MediaFormat.KEY_BITRATE_MODE,
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+                )
 
                 if (useExtendedFlags) {
                     setInteger(MediaFormat.KEY_PRIORITY, 0)
@@ -219,6 +273,19 @@ class LowLatencyEncoder(
                     ) {
                         setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                     }
+
+                    if (useVendorExtensions) {
+                        // MediaTek Dimensity low-latency & no frame-dropping vendor extensions (e.g. Poco X8 Pro)
+                        try {
+                            setInteger("vendor.mtk.ext.venc.lowlatency", 1)
+                            setInteger("vendor.mtk.ext.venc.frame-dropping", 0)
+                        } catch (_: Exception) {}
+
+                        // Qualcomm Snapdragon hardware encoder low-latency extensions
+                        try {
+                            setInteger("vendor.qti-ext-enc-low-latency.enable", 1)
+                        } catch (_: Exception) {}
+                    }
                 }
             }
 
@@ -228,7 +295,7 @@ class LowLatencyEncoder(
             actualFps = targetFps
             mc
         } catch (e: Exception) {
-            Log.w(TAG, "Tier config rejected ($mime ${width}x${height}@${fps}fps, ext=$useExtendedFlags): ${e.message}")
+            Log.w(TAG, "Tier config rejected ($mime ${width}x${height}@${fps}fps, ext=$useExtendedFlags, vendor=$useVendorExtensions): ${e.message}")
             try {
                 mc?.release()
             } catch (_: Exception) {
@@ -368,6 +435,10 @@ class LowLatencyEncoder(
 
     fun stop() {
         if (!isEncoding.getAndSet(false)) return
+        try {
+            mediaProjection.unregisterCallback(projectionCallback)
+        } catch (_: Exception) {
+        }
         try {
             virtualDisplay?.release()
         } catch (_: Exception) {
