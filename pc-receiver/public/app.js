@@ -1,14 +1,14 @@
 (() => {
   const canvas = document.getElementById("mirrorCanvas");
-  const ctx =
-    canvas.getContext("2d", { alpha: false, desynchronized: true }) ||
-    canvas.getContext("2d");
+  // Standard 2D context double-buffered with browser compositor prevents VSync tearing
+  const ctx = canvas.getContext("2d", { alpha: false }) || canvas.getContext("2d");
 
   const emptyOverlay = document.getElementById("emptyOverlay");
   const hudStatusDot = document.getElementById("hudStatusDot");
   const hudStatusText = document.getElementById("hudStatusText");
   const hudCodec = document.getElementById("hudCodec");
   const hudFps = document.getElementById("hudFps");
+  const hudMonitorHz = document.getElementById("hudMonitorHz");
   const hudBitrate = document.getElementById("hudBitrate");
   const hudEncodeMs = document.getElementById("hudEncodeMs");
   const hudDecodeMs = document.getElementById("hudDecodeMs");
@@ -21,11 +21,21 @@
   const btnConnectPhone = document.getElementById("btnConnectPhone");
   const connectionToast = document.getElementById("connectionToast");
 
-  // Orientation / Crop / Fullscreen controls
+  // Discovered Phone & Reconnect Banner
+  const discoveredPhoneCard = document.getElementById("discoveredPhoneCard");
+  const discPhoneName = document.getElementById("discPhoneName");
+  const discPhoneIp = document.getElementById("discPhoneIp");
+  const btnConnectDiscovered = document.getElementById("btnConnectDiscovered");
+  const reconnectBanner = document.getElementById("reconnectBanner");
+  const reconnectText = document.getElementById("reconnectText");
+  const btnCancelReconnect = document.getElementById("btnCancelReconnect");
+
+  // Orientation / Crop / Fullscreen / VSync controls
   const btnCropLandscape = document.getElementById("btnCropLandscape");
   const btnRotate = document.getElementById("btnRotate");
   const btnScaleMode = document.getElementById("btnScaleMode");
   const btnFullscreen = document.getElementById("btnFullscreen");
+  const btnVsyncMode = document.getElementById("btnVsyncMode");
   const btnQuickCinema = document.getElementById("btnQuickCinema");
   const btnFloatCrop = document.getElementById("btnFloatCrop");
   const btnFloatRotate = document.getElementById("btnFloatRotate");
@@ -38,6 +48,9 @@
   const btnForceIdr = document.getElementById("btnForceIdr");
   const btnNativeFfplay = document.getElementById("btnNativeFfplay");
   const btnSimulator = document.getElementById("btnSimulator");
+  const btnSimFps60 = document.getElementById("btnSimFps60");
+  const btnSimFps120 = document.getElementById("btnSimFps120");
+  const btnSimFps144 = document.getElementById("btnSimFps144");
   const viewportContainer = document.getElementById("viewportContainer");
 
   // Log Modal Elements
@@ -63,6 +76,7 @@
   let audioVolume = 1.0;
   let nextAudioPlayTime = 0;
   let clientLogStreak = 0;
+  let discoveredPhone = null;
 
   function reportClientLog(level, message) {
     if (clientLogStreak++ > 300) return;
@@ -79,30 +93,53 @@
     class HyperAudioProcessor extends AudioWorkletProcessor {
       constructor() {
         super();
-        this.capacity = 48000;
+        // 96,000 samples capacity = 2 seconds at 48kHz, handles any packet chunk size or burst
+        this.capacity = 96000;
         this.bufL = new Float32Array(this.capacity);
         this.bufR = new Float32Array(this.capacity);
         this.writePos = 0;
         this.readPos = 0;
         this.available = 0;
-        // 25ms Target Jitter Buffer for Silky-Smooth Ultra-Low-Latency Gaming Sound
-        this.targetSamples = 1200; // 25ms @ 48kHz
-        this.maxSamples = 2400;    // 50ms Maximum Latency Clamp
+
+        // 25ms Dynamic Jitter Buffer scaled to AudioContext native sampleRate
+        // 25ms @ 48kHz = 1200 samples, @ 44.1kHz = 1102 samples, @ 96kHz = 2400 samples
+        this.targetSamples = Math.round(sampleRate * 0.025);
+        this.maxSamples = Math.round(sampleRate * 0.050); // 50ms Maximum Latency Clamp
 
         this.port.onmessage = (e) => {
+          if (e.data && e.data.type === "flush") {
+            this.writePos = 0;
+            this.readPos = 0;
+            this.available = 0;
+            return;
+          }
+
           const { left, right } = e.data;
           const len = left.length;
+          if (len === 0) return;
+
           for (let i = 0; i < len; i++) {
             this.bufL[this.writePos] = left[i];
             this.bufR[this.writePos] = right[i];
             this.writePos = (this.writePos + 1) % this.capacity;
           }
-          this.available += len;
+          this.available = Math.min(this.capacity - 1, this.available + len);
 
-          // Latency Clamp: if audio backlog builds up beyond 50ms, gently clamp to 25ms!
+          // Latency Clamp: if audio backlog builds up beyond 50ms (e.g. Wi-Fi packet jitter burst):
+          // Smoothly crossfade over 32 samples across the skip point to completely eliminate CLICK / POP!
           if (this.available > this.maxSamples) {
-            const skip = this.available - this.targetSamples;
-            this.readPos = (this.readPos + skip) % this.capacity;
+            const excess = this.available - this.targetSamples;
+            const crossfadeLen = Math.min(32, this.targetSamples);
+            const oldRead = this.readPos;
+            const newRead = (oldRead + excess) % this.capacity;
+            for (let i = 0; i < crossfadeLen; i++) {
+              const alpha = i / crossfadeLen;
+              const pOld = (oldRead + i) % this.capacity;
+              const pNew = (newRead + i) % this.capacity;
+              this.bufL[pNew] = this.bufL[pOld] * (1 - alpha) + this.bufL[pNew] * alpha;
+              this.bufR[pNew] = this.bufR[pOld] * (1 - alpha) + this.bufR[pNew] * alpha;
+            }
+            this.readPos = newRead;
             this.available = this.targetSamples;
           }
         };
@@ -114,16 +151,28 @@
         const outR = out[1];
         const n = outL.length; // 128 samples
 
-        // Drain up to n samples from ring buffer with exact fractional preservation
         const toCopy = Math.min(this.available, n);
         for (let i = 0; i < toCopy; i++) {
           outL[i] = this.bufL[this.readPos];
           outR[i] = this.bufR[this.readPos];
           this.readPos = (this.readPos + 1) % this.capacity;
         }
-        outL.fill(0, toCopy);
-        outR.fill(0, toCopy);
         this.available -= toCopy;
+
+        if (toCopy < n) {
+          // If buffer underrun occurs (e.g. Wi-Fi packet drop):
+          // Smoothly ramp trailing samples down over 8 samples to 0 to prevent harsh click/pop!
+          if (toCopy > 0) {
+            const rampLen = Math.min(8, toCopy);
+            for (let i = 0; i < rampLen; i++) {
+              const gain = (rampLen - 1 - i) / rampLen;
+              outL[toCopy - rampLen + i] *= gain;
+              outR[toCopy - rampLen + i] *= gain;
+            }
+          }
+          outL.fill(0, toCopy);
+          outR.fill(0, toCopy);
+        }
         return true;
       }
     }
@@ -136,11 +185,25 @@
     if (!AudioContextClass) return null;
 
     try {
-      audioCtx = new AudioContextClass({ latencyHint: "interactive", sampleRate: 48000 });
+      try {
+        audioCtx = new AudioContextClass({ latencyHint: "interactive", sampleRate: 48000 });
+      } catch (_) {
+        // Fallback: If 48kHz fixed sampleRate is rejected by browser/OS audio driver, use native rate
+        audioCtx = new AudioContextClass({ latencyHint: "interactive" });
+      }
+
       gainNode = audioCtx.createGain();
       gainNode.gain.setValueAtTime(isAudioMuted ? 0 : audioVolume, audioCtx.currentTime);
       gainNode.connect(audioCtx.destination);
       reportClientLog("INFO", `WebAudio AudioContext created (state=${audioCtx.state}, sampleRate=${audioCtx.sampleRate})`);
+
+      audioCtx.onstatechange = () => {
+        reportClientLog("INFO", `AudioContext state changed: ${audioCtx.state}`);
+        updateAudioUI();
+        if (audioCtx.state === "running" && audioWorkletNode) {
+          audioWorkletNode.port.postMessage({ type: "flush" });
+        }
+      };
 
       if ("audioWorklet" in audioCtx && !audioWorkletNode && !isWorkletInitializing) {
         isWorkletInitializing = true;
@@ -153,7 +216,7 @@
               outputChannelCount: [2],
             });
             audioWorkletNode.connect(gainNode);
-            reportClientLog("INFO", "AudioWorklet Zero-Latency Engine activated (<25ms jitter buffer)");
+            reportClientLog("INFO", `AudioWorklet Zero-Latency Engine activated (<25ms jitter buffer, nativeRate=${audioCtx.sampleRate})`);
           })
           .catch((err) => {
             reportClientLog("WARN", `AudioWorklet addModule error: ${err.message}, using fallback`);
@@ -187,6 +250,8 @@
     if (lblVolumeVal) lblVolumeVal.textContent = `${volPercent}%`;
     if (sliderVolume) sliderVolume.value = volPercent;
 
+    const rateHint = audioCtx && audioCtx.sampleRate !== 48000 ? ` (${(audioCtx.sampleRate / 1000).toFixed(1)}k)` : "";
+
     if (isAudioMuted || audioVolume === 0) {
       if (hudAudioStatus) {
         hudAudioStatus.textContent = "🔇 TẮT";
@@ -203,10 +268,10 @@
       if (btnFloatAudio) btnFloatAudio.textContent = "🔇 Click bật tiếng (M)";
     } else {
       if (hudAudioStatus) {
-        hudAudioStatus.textContent = `🔊 ${volPercent}%`;
+        hudAudioStatus.textContent = `🔊 ${volPercent}%${rateHint}`;
         hudAudioStatus.className = "highlight-cyan";
       }
-      if (btnToggleAudio) btnToggleAudio.textContent = "🔊 Đang bật (M)";
+      if (btnToggleAudio) btnToggleAudio.textContent = `🔊 Đang bật (M)${rateHint}`;
       if (btnFloatAudio) btnFloatAudio.textContent = "🔊 Tắt tiếng (M)";
     }
   }
@@ -233,14 +298,40 @@
     updateAudioUI();
   }
 
+  // High-precision linear resampler with fractional phase accumulator
+  function resampleStereo(leftIn, rightIn, inRate, outRate) {
+    if (inRate === outRate || Math.abs(inRate - outRate) < 5) {
+      return { left: leftIn, right: rightIn };
+    }
+    const ratio = inRate / outRate;
+    const inLen = leftIn.length;
+    const outLen = Math.floor(inLen / ratio);
+    if (outLen <= 0) return { left: leftIn, right: rightIn };
+    const leftOut = new Float32Array(outLen);
+    const rightOut = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const srcPos = i * ratio;
+      const idx0 = Math.floor(srcPos);
+      const idx1 = Math.min(idx0 + 1, inLen - 1);
+      const frac = srcPos - idx0;
+      leftOut[i] = leftIn[idx0] * (1 - frac) + leftIn[idx1] * frac;
+      rightOut[i] = rightIn[idx0] * (1 - frac) + rightIn[idx1] * frac;
+    }
+    return { left: leftOut, right: rightOut };
+  }
+
   function handleAudioPacket(view, arrayBuffer) {
-    const sampleRate = view.getUint32(10, false) || 48000;
+    const senderSampleRate = view.getUint32(10, false) || 48000;
     const payloadOffset = 14;
     const payloadByteLen = arrayBuffer.byteLength - payloadOffset;
     if (payloadByteLen < 4) return;
 
     if (!audioCtx) initAudioContext();
-    if (!audioCtx || audioCtx.state !== "running") {
+    if (!audioCtx) return;
+
+    // Auto-attempt resume if browser suspended audio
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume().catch(() => {});
       updateAudioUI();
       return;
     }
@@ -250,25 +341,34 @@
     if (numFrames === 0) return;
 
     const int16 = new Int16Array(arrayBuffer, payloadOffset, numFrames * 2);
-    const left = new Float32Array(numFrames);
-    const right = new Float32Array(numFrames);
+    let left = new Float32Array(numFrames);
+    let right = new Float32Array(numFrames);
 
     for (let i = 0; i < numFrames; i++) {
       left[i] = int16[i * 2] / 32768.0;
       right[i] = int16[i * 2 + 1] / 32768.0;
     }
 
+    // Handle Sample Rate Mismatch:
+    // If phone sends 48kHz but AudioContext runs at 44.1kHz or 96kHz, resample seamlessly!
+    const ctxRate = audioCtx.sampleRate || 48000;
+    if (senderSampleRate !== ctxRate) {
+      const resampled = resampleStereo(left, right, senderSampleRate, ctxRate);
+      left = resampled.left;
+      right = resampled.right;
+    }
+
     if (audioWorkletNode) {
       audioWorkletNode.port.postMessage({ left, right }, [left.buffer, right.buffer]);
     } else {
       // Ultra-Low-Latency Fallback (Locked to 20-50ms)
-      const audioBuf = audioCtx.createBuffer(2, numFrames, sampleRate);
+      const audioBuf = audioCtx.createBuffer(2, left.length, ctxRate);
       audioBuf.copyToChannel(left, 0);
       audioBuf.copyToChannel(right, 1);
 
       const now = audioCtx.currentTime;
       const TARGET_LATENCY_SEC = 0.025; // 25ms target
-      if (nextAudioPlayTime < now || nextAudioPlayTime > now + 0.060) {
+      if (nextAudioPlayTime < now || nextAudioPlayTime > now + 0.050) {
         nextAudioPlayTime = now + TARGET_LATENCY_SEC;
       }
 
@@ -321,6 +421,9 @@
     }
   }
 
+  let lastCanvasW = 0;
+  let lastCanvasH = 0;
+
   function drawVideoSourceToCanvas(source, rawW, rawH) {
     let sx = 0;
     let sy = 0;
@@ -342,9 +445,19 @@
     const outW = cropLandscape16x9 ? 1920 : isRotated90 ? sh : sw;
     const outH = cropLandscape16x9 ? 1080 : isRotated90 ? sw : sh;
 
-    if (canvas.width !== outW || canvas.height !== outH) {
+    if (lastCanvasW !== outW || lastCanvasH !== outH) {
       canvas.width = outW;
       canvas.height = outH;
+      lastCanvasW = outW;
+      lastCanvasH = outH;
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "medium";
+    }
+
+    // Fast path: direct draw for standard unrotated, uncropped view
+    if (rotationDeg === 0 && !cropLandscape16x9 && sw === outW && sh === outH) {
+      ctx.drawImage(source, 0, 0, outW, outH);
+      return;
     }
 
     ctx.save();
@@ -360,6 +473,66 @@
       }
     }
     ctx.restore();
+  }
+
+  // VSync-Synchronized Render Loop (prevents tearing on 120Hz/144Hz displays)
+  let vsyncMode = true;
+  let latestVideoFrame = null;
+  let monitorRefreshRate = 0;
+  let rafFpsSamples = [];
+  let lastRafTime = 0;
+
+  function startVsyncRenderLoop() {
+    function onRaf(timestamp) {
+      if (lastRafTime > 0) {
+        const dt = timestamp - lastRafTime;
+        if (dt > 3 && dt < 40) {
+          rafFpsSamples.push(1000 / dt);
+          if (rafFpsSamples.length > 30) {
+            rafFpsSamples.shift();
+            const avgHz = Math.round(
+              rafFpsSamples.reduce((a, b) => a + b, 0) / rafFpsSamples.length
+            );
+            if (avgHz >= 45 && avgHz <= 360) {
+              monitorRefreshRate = avgHz;
+              if (hudMonitorHz) {
+                hudMonitorHz.textContent = `${avgHz}Hz (${vsyncMode ? "VSync" : "Direct"})`;
+              }
+            }
+          }
+        }
+      }
+      lastRafTime = timestamp;
+
+      if (vsyncMode && latestVideoFrame) {
+        const frameToDraw = latestVideoFrame;
+        latestVideoFrame = null;
+        drawVideoSourceToCanvas(frameToDraw, frameToDraw.displayWidth, frameToDraw.displayHeight);
+        frameToDraw.close();
+      }
+
+      requestAnimationFrame(onRaf);
+    }
+    requestAnimationFrame(onRaf);
+  }
+
+  function toggleVsyncMode() {
+    vsyncMode = !vsyncMode;
+    if (btnVsyncMode) {
+      btnVsyncMode.textContent = vsyncMode
+        ? "🖥️ VSync 120/144Hz: BẬT (0 Xé hình) (V)"
+        : "⚡ Chế độ: Direct Blit (Cực thấp ms) (V)";
+      btnVsyncMode.classList.toggle("active", vsyncMode);
+    }
+    if (hudMonitorHz) {
+      const hzStr = monitorRefreshRate ? `${monitorRefreshRate}Hz` : "-- Hz";
+      hudMonitorHz.textContent = `${hzStr} (${vsyncMode ? "VSync" : "Direct"})`;
+    }
+    setToast(
+      vsyncMode
+        ? "Đã bật VSync 120Hz/144Hz: Khóa theo tần số quét màn hình, triệt tiêu xé hình!"
+        : "Đã bật Direct Blit: Vẽ tức thì không chờ VSync (độ trễ tuyệt đối thấp nhất)."
+    );
   }
 
   function toggleCropLandscape() {
@@ -487,16 +660,19 @@
     return { hasConfig, hasIdr, hasSlice };
   }
 
+  let currentConfiguredCodec = "";
+
   function ensureHardwareDecoder(codecId) {
     if (!("VideoDecoder" in window)) {
       return false;
     }
 
-    // NEVER close or reset an already-configured working VideoDecoder unless codecId changed or it closed!
+    // If already configured for this codec AND codec string matches detected SPS (or default), keep it!
     if (
       videoDecoder &&
       videoDecoder.state === "configured" &&
-      activeCodecId === codecId
+      activeCodecId === codecId &&
+      (!detectedSpsCodecString || currentConfiguredCodec === detectedSpsCodecString)
     ) {
       return true;
     }
@@ -518,30 +694,37 @@
           pendingDecodeTimestamps.delete(frame.timestamp);
         }
 
-        drawVideoSourceToCanvas(frame, frame.displayWidth, frame.displayHeight);
-        frame.close();
-
         emptyOverlay.classList.add("hidden");
         frameCountWindow++;
+
+        if (vsyncMode) {
+          // VSync Latch: Lock to monitor scanout boundary to eliminate screen tearing!
+          if (latestVideoFrame) {
+            latestVideoFrame.close();
+          }
+          latestVideoFrame = frame;
+        } else {
+          // Direct Blit Mode (Immediate)
+          drawVideoSourceToCanvas(frame, frame.displayWidth, frame.displayHeight);
+          frame.close();
+        }
       },
       error: (err) => {
         console.warn("[WebCodecs decode error]", err);
         waitingForKeyFrame = true;
         pendingDecodeTimestamps.clear();
-        // A decoder that errored is dead: release it and stop re-configuring
-        // every single frame (prevents an endless warning/IDR flood).
         try {
           if (videoDecoder && videoDecoder.state !== "closed") videoDecoder.close();
         } catch (_) {}
         videoDecoder = null;
         activeCodecId = 0;
+        currentConfiguredCodec = "";
         decoderErrorStreak++;
         if (decoderErrorStreak >= 2 && !useJpegFallback) {
           useJpegFallback = true;
           setToast(
-            "GPU WebCodecs không hỗ trợ codec này — đã chuyển sang chế độ giải mã JPEG dự phòng."
+            "GPU WebCodecs không hỗ trợ profile này — đã chuyển sang chế độ giải mã JPEG dự phòng."
           );
-          // Reconnect so the server starts the MJPEG fallback pipeline.
           try {
             currentWs.close();
           } catch (_) {}
@@ -555,15 +738,29 @@
 
     const candidates =
       codecId === 2
-        ? ["hev1.1.6.L120.90", "hvc1.1.6.L120.90"]
+        ? [
+            "hev1.1.6.L156.90", // HEVC Level 5.2 (120/144Hz high refresh rate gaming)
+            "hev1.1.6.L153.90", // HEVC Level 5.1 (120Hz)
+            "hev1.1.6.L120.90", // HEVC Level 4.0
+            "hvc1.1.6.L156.90",
+            "hvc1.1.6.L153.90",
+            "hvc1.1.6.L120.90",
+          ]
         : [
-            detectedSpsCodecString,
-            "avc1.64002a",
-            "avc1.4d402a",
-            "avc1.42e01f",
+            detectedSpsCodecString, // From SPS: e.g. avc1.640034 (144Hz) or avc1.640033 (120Hz)
+            "avc1.640034", // H.264 High Profile Level 5.2 (144Hz/172Hz 1080p)
+            "avc1.640033", // H.264 High Profile Level 5.1 (120Hz 1080p)
+            "avc1.64002a", // H.264 High Profile Level 4.2
+            "avc1.4d4034", // H.264 Main Profile Level 5.2
+            "avc1.4d4033", // H.264 Main Profile Level 5.1
+            "avc1.4d402a", // H.264 Main Profile Level 4.2
+            "avc1.42e034", // H.264 Baseline Level 5.2
+            "avc1.42e033", // H.264 Baseline Level 5.1
+            "avc1.42e01f", // H.264 Baseline Level 3.1
           ];
 
     for (const c of candidates) {
+      if (!c) continue;
       try {
         videoDecoder.configure({
           codec: c,
@@ -571,6 +768,7 @@
           hardwareAcceleration: "prefer-hardware",
         });
         activeCodecId = codecId;
+        currentConfiguredCodec = c;
         waitingForKeyFrame = true;
         return true;
       } catch (_) {
@@ -580,6 +778,7 @@
             optimizeForLatency: true,
           });
           activeCodecId = codecId;
+          currentConfiguredCodec = c;
           waitingForKeyFrame = true;
           return true;
         } catch (_) {}
@@ -653,6 +852,12 @@
     }
 
     if (!ensureHardwareDecoder(codecId)) return;
+
+    if (videoDecoder && videoDecoder.decodeQueueSize > 4) {
+      waitingForKeyFrame = true;
+      requestIdrThrottled();
+      return;
+    }
 
     const isKey = frameType === 2 || nalInfo.hasIdr;
     if (waitingForKeyFrame && !isKey) {
@@ -732,9 +937,21 @@
 
   let currentWs = null;
   let reconnectTimer = null;
+  let wsReconnectAttempts = 0;
 
-  function scheduleReconnect(delay = 1200) {
+  function scheduleReconnect(immediate = false) {
     if (reconnectTimer) return;
+    if (immediate) {
+      connectWebSocket();
+      return;
+    }
+    // Exponential backoff: 500ms, 1s, 2s, 4s, 8s, up to 10s max + jitter
+    const base = Math.min(10000, 500 * Math.pow(1.5, Math.min(wsReconnectAttempts, 8)));
+    const jitter = Math.floor(Math.random() * 300);
+    const delay = Math.round(base + jitter);
+    wsReconnectAttempts++;
+
+    setToast(`Mất kết nối với máy chủ PC. Đang thử lại sau ${(delay / 1000).toFixed(1)}s (lần ${wsReconnectAttempts})...`);
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connectWebSocket();
@@ -760,17 +977,45 @@
     ws.binaryType = "arraybuffer";
     currentWs = ws;
 
+    ws.onopen = () => {
+      wsReconnectAttempts = 0;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      reportClientLog("INFO", "WebSocket connected to PC receiver");
+    };
+
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
         try {
           const msg = JSON.parse(ev.data);
           if (msg.type === "status" && msg.meta) {
             updateStatusUI(msg.meta);
+          } else if (msg.type === "phone_discovered") {
+            if (discoveredPhoneCard) {
+              discoveredPhone = { host: msg.host, port: msg.port, name: msg.deviceName };
+              if (discPhoneName) discPhoneName.textContent = msg.deviceName || "Thiết bị Android";
+              if (discPhoneIp) discPhoneIp.textContent = `${msg.host}:${msg.port}`;
+              discoveredPhoneCard.style.display = "flex";
+            }
+          } else if (msg.type === "reconnect_status") {
+            if (reconnectBanner) {
+              if (msg.reconnecting) {
+                reconnectBanner.style.display = "flex";
+                const sec = msg.delayMs ? (msg.delayMs / 1000).toFixed(1) : "vài";
+                if (reconnectText) {
+                  reconnectText.textContent = `🔄 Đang tự động kết nối lại ${msg.target}:${msg.port} sau ${sec}s (lần ${msg.attempt})...`;
+                }
+              } else {
+                reconnectBanner.style.display = "none";
+              }
+            }
           } else if (msg.type === "simulator") {
             btnSimulator.classList.toggle("active", Boolean(msg.active));
             btnSimulator.textContent = msg.active
-              ? "⏹ Dừng Luồng Giả Lập 60FPS H.264"
-              : "🎮 Chạy Luồng Giả Lập 60FPS H.264 (Test Ngay Trên PC)";
+              ? `⏹ Dừng Luồng Giả Lập ${msg.fps || simSelectedFps}FPS H.264`
+              : "🎮 Chạy Luồng Giả Lập H.264 (Test Ngay Trên PC)";
           } else if (msg.type === "ffplay") {
             btnNativeFfplay.textContent = msg.active
               ? "⏹ Đóng cửa sổ Native Direct3D (FFplay)"
@@ -794,12 +1039,20 @@
       const info = await res.json();
       streamPortEl.textContent = info.streamPort;
       if (info.lanIps && info.lanIps.length > 0) {
-        pcLanIp.textContent = info.lanIps.map((i) => i.address).join(" / ");
+        const primary = info.lanIps[0].address;
+        const others = info.lanIps.slice(1).map((i) => i.address).join(", ");
+        pcLanIp.textContent = primary + (others ? ` (phụ: ${others})` : "");
       } else {
         pcLanIp.textContent = "127.0.0.1 (USB Mode)";
       }
       if (info.meta) {
         updateStatusUI(info.meta);
+      }
+      if (info.reconnectStatus && info.reconnectStatus.reconnecting && reconnectBanner) {
+        reconnectBanner.style.display = "flex";
+        if (reconnectText) {
+          reconnectText.textContent = `🔄 Đang tự động kết nối lại ${info.reconnectStatus.target}:${info.reconnectStatus.port}...`;
+        }
       }
     } catch (_) {}
   }
@@ -831,6 +1084,32 @@
     const data = await res.json();
     setToast(data.message);
   });
+
+  if (btnConnectDiscovered) {
+    btnConnectDiscovered.addEventListener("click", async () => {
+      if (!discoveredPhone) return;
+      if (inputPhoneIp) inputPhoneIp.value = discoveredPhone.host;
+      setToast(`Đang kết nối tới ${discoveredPhone.name} (${discoveredPhone.host})...`);
+      const res = await fetch("/api/connect-phone", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ host: discoveredPhone.host, port: discoveredPhone.port }),
+      });
+      const data = await res.json();
+      setToast(data.message);
+      if (data.ok && discoveredPhoneCard) {
+        discoveredPhoneCard.style.display = "none";
+      }
+    });
+  }
+
+  if (btnCancelReconnect) {
+    btnCancelReconnect.addEventListener("click", async () => {
+      await fetch("/api/cancel-reconnect", { method: "POST" }).catch(() => {});
+      if (reconnectBanner) reconnectBanner.style.display = "none";
+      setToast("Đã dừng tự động kết nối lại.");
+    });
+  }
 
   async function applyBitrate(mbps) {
     sliderBitrate.value = mbps;
@@ -876,6 +1155,8 @@
   if (btnFullscreen) btnFullscreen.addEventListener("click", toggleTrueFullscreen);
   if (btnFloatExitFs) btnFloatExitFs.addEventListener("click", toggleTrueFullscreen);
 
+  if (btnVsyncMode) btnVsyncMode.addEventListener("click", toggleVsyncMode);
+
   if (btnQuickCinema) {
     btnQuickCinema.addEventListener("click", () => {
       document.body.classList.toggle("cinema-mode");
@@ -884,7 +1165,24 @@
 
   viewportContainer.addEventListener("dblclick", toggleTrueFullscreen);
 
-  window.addEventListener("click", ensureAudioRunning, { passive: true });
+  // Resume audio on page interaction or tab focus
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && audioCtx && audioCtx.state === "suspended") {
+      audioCtx.resume().then(() => updateAudioUI()).catch(() => {});
+    }
+  });
+
+  if (navigator.mediaDevices) {
+    navigator.mediaDevices.addEventListener("devicechange", () => {
+      if (audioCtx && audioCtx.state === "suspended") {
+        audioCtx.resume().then(() => updateAudioUI()).catch(() => {});
+      }
+    });
+  }
+
+  ["click", "pointerdown", "keydown", "touchstart"].forEach((evt) => {
+    window.addEventListener(evt, ensureAudioRunning, { passive: true, once: false });
+  });
 
   window.addEventListener("keydown", (e) => {
     ensureAudioRunning();
@@ -896,6 +1194,8 @@
       rotateCanvas90();
     } else if (key === "z") {
       cycleScaleMode();
+    } else if (key === "v") {
+      toggleVsyncMode();
     } else if (key === "m") {
       toggleAudioMute();
     } else if (key === "f" || e.key === "F11") {
@@ -930,19 +1230,35 @@
     }
   });
 
+  // Simulator FPS Selection (60Hz / 120Hz / 144Hz)
+  let simSelectedFps = 60;
+  const simFpsList = [
+    { el: btnSimFps60, fps: 60 },
+    { el: btnSimFps120, fps: 120 },
+    { el: btnSimFps144, fps: 144 },
+  ];
+  simFpsList.forEach(({ el, fps }) => {
+    if (!el) return;
+    el.addEventListener("click", () => {
+      simSelectedFps = fps;
+      simFpsList.forEach((c) => c.el && c.el.classList.toggle("active", c.fps === fps));
+      setToast(`Đã chọn tốc độ giả lập: ${fps} FPS`);
+    });
+  });
+
   btnSimulator.addEventListener("click", async () => {
     const res = await fetch("/api/simulator", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        fps: 60,
-        bitrateMbps: Number(sliderBitrate.value || 12),
+        fps: simSelectedFps,
+        bitrateMbps: Number(sliderBitrate.value || 16),
       }),
     });
     const data = await res.json();
     setToast(
       data.active
-        ? "Đang phát luồng H.264 60FPS Zero-Latency giả lập!"
+        ? `Đang phát luồng H.264 ${simSelectedFps}FPS Zero-Latency giả lập!`
         : "Đã dừng luồng giả lập."
     );
   });
@@ -988,6 +1304,7 @@
     });
   }
 
+  startVsyncRenderLoop();
   loadServerInfo();
   connectWebSocket();
 })();

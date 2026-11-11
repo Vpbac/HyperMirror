@@ -41,6 +41,26 @@
           <input id="inputPhoneIp" type="text" placeholder="Hoặc nhập IP Điện thoại (VD: 192.168.1.50)" value="127.0.0.1" />
           <button id="btnConnectPhone" class="btn btn-secondary">Kết nối</button>
         </div>
+
+        <!-- Auto-Discovered Phone Card -->
+        <div id="discoveredPhoneCard" class="discovered-card" style="display: none;">
+          <div class="disc-info">
+            <span class="disc-title">📱 Tìm thấy thiết bị trên Wi-Fi:</span>
+            <strong id="discPhoneName" class="highlight-cyan">Android Phone</strong>
+            <small id="discPhoneIp" class="disc-ip">192.168.1.50:27184</small>
+          </div>
+          <button id="btnConnectDiscovered" class="btn btn-primary btn-sm">Kết Nối Ngay</button>
+        </div>
+
+        <!-- Auto-Reconnect with Exponential Backoff Banner -->
+        <div id="reconnectBanner" class="reconnect-banner" style="display: none;">
+          <div class="reconnect-info">
+            <span class="pulse-dot"></span>
+            <span id="reconnectText">🔄 Đang tự động kết nối lại...</span>
+          </div>
+          <button id="btnCancelReconnect" class="btn btn-outline btn-sm">Hủy</button>
+        </div>
+
         <div id="connectionToast" class="toast-msg">Sẵn sàng nhận kết nối từ App Android HyperMirror</div>
       </section>
 
@@ -63,6 +83,9 @@
             ⛶ Fullscreen 1080p (F)
           </button>
         </div>
+        <button id="btnVsyncMode" class="btn btn-outline" style="margin-top: 4px;" title="Chế độ VSync chống xé hình mượt mà cho màn hình 120Hz/144Hz (Phím V)">
+          🖥️ VSync 120/144Hz: BẬT (0 Xé hình) (V)
+        </button>
       </section>
 
       <!-- Live Gaming Optimization Section -->
@@ -99,8 +122,13 @@
           🚀 Mở cửa sổ Native Direct3D (FFplay Zero-Buffer)
         </button>
         <button id="btnSimulator" class="btn btn-sim">
-          🎮 Chạy Luồng Giả Lập 60FPS H.264 (Test Ngay Trên PC)
+          🎮 Chạy Luồng Giả Lập H.264 (Test Ngay Trên PC)
         </button>
+        <div class="preset-row" style="margin-top: 2px;">
+          <button class="btn-chip active" id="btnSimFps60" data-fps="60">60 FPS</button>
+          <button class="btn-chip" id="btnSimFps120" data-fps="120">120 FPS</button>
+          <button class="btn-chip" id="btnSimFps144" data-fps="144">144 FPS</button>
+        </div>
         <button id="btnViewLogs" class="btn btn-secondary" style="margin-top: 8px;">
           📋 Xem Nhật Ký / Logs Trực Tiếp (Debug)
         </button>
@@ -124,6 +152,11 @@
         <div class="hud-metric">
           <span class="label">FPS THỰC TẾ</span>
           <strong id="hudFps" class="highlight-cyan">0 FPS</strong>
+        </div>
+
+        <div class="hud-metric" id="hudMonitorMetric" title="Tần số quét màn hình PC &amp; Chế độ đồng bộ VSync">
+          <span class="label">MÀN HÌNH / VSYNC</span>
+          <strong id="hudMonitorHz" class="highlight-cyan">-- Hz (VSync)</strong>
         </div>
 
         <div class="hud-metric">

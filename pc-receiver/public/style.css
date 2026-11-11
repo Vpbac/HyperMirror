@@ -192,6 +192,74 @@ body.cinema-mode .hud-bar {
   font-size: 12px;
 }
 
+.discovered-card {
+  background: rgba(0, 240, 255, 0.08);
+  border: 1px solid rgba(0, 240, 255, 0.35);
+  border-radius: 6px;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.disc-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.disc-title {
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.disc-ip {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.reconnect-banner {
+  background: rgba(255, 171, 0, 0.12);
+  border: 1px solid rgba(255, 171, 0, 0.4);
+  border-radius: 6px;
+  padding: 6px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+  color: #ffab00;
+}
+
+.reconnect-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pulse-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #ffab00;
+  box-shadow: 0 0 8px #ffab00;
+  animation: pulseDotAnim 1.2s infinite;
+}
+
+@keyframes pulseDotAnim {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.3; transform: scale(0.7); }
+}
+
+.btn-sm {
+  padding: 4px 8px !important;
+  font-size: 11px !important;
+  width: auto !important;
+}
+
 .toast-msg {
   font-size: 11.5px;
   color: var(--text-muted);

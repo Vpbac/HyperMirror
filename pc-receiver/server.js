@@ -211,17 +211,55 @@ setInterval(() => {
 
 const wsClients = new Set();
 
+function ipAndMaskToBroadcast(ipStr, maskStr) {
+  try {
+    const ipParts = ipStr.split(".").map(Number);
+    const maskParts = (maskStr || "255.255.255.0").split(".").map(Number);
+    if (ipParts.length !== 4 || maskParts.length !== 4) return null;
+    const ipInt = ((ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3]) >>> 0;
+    const maskInt = ((maskParts[0] << 24) | (maskParts[1] << 16) | (maskParts[2] << 8) | maskParts[3]) >>> 0;
+    const broadcastInt = (ipInt | (~maskInt >>> 0)) >>> 0;
+    return [
+      (broadcastInt >>> 24) & 255,
+      (broadcastInt >>> 16) & 255,
+      (broadcastInt >>> 8) & 255,
+      broadcastInt & 255,
+    ].join(".");
+  } catch (_) {
+    return null;
+  }
+}
+
 function getLocalLanIps() {
   const nets = os.networkInterfaces();
-  const ips = [];
+  const physicalIps = [];
+  const virtualIps = [];
+
   for (const name of Object.keys(nets)) {
+    const isVirtual = /(radmin|tailscale|hamachi|zerotier|virtual|vbox|vmware|hyper-v|vethernet|wsl|docker|loopback|tap|tun)/i.test(name);
     for (const iface of nets[name] || []) {
       if (iface.family === "IPv4" && !iface.internal) {
-        ips.push({ interface: name, address: iface.address });
+        if (iface.address.startsWith("169.254.")) continue; // Ignore APIPA
+        const netmask = iface.netmask || "255.255.255.0";
+        const broadcast = ipAndMaskToBroadcast(iface.address, netmask) || "255.255.255.255";
+        const entry = {
+          interface: name,
+          address: iface.address,
+          netmask,
+          broadcast,
+          isVirtual,
+        };
+        if (isVirtual) {
+          virtualIps.push(entry);
+        } else {
+          physicalIps.push(entry);
+        }
       }
     }
   }
-  return ips;
+
+  // Physical LAN/Wi-Fi adapters first so user and phone always see the true Wi-Fi IP
+  return [...physicalIps, ...virtualIps];
 }
 
 function encodeWsFrame(opcode, payloadBuffer) {
@@ -435,6 +473,13 @@ function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
 
   streamMeta.connected = true;
   streamMeta.remoteAddress = `${socket.remoteAddress || "127.0.0.1"}:${socket.remotePort || STREAM_PORT} (${modeLabel})`;
+
+  const remoteIp = socket.remoteAddress ? socket.remoteAddress.replace(/^.*:/, "") : "";
+  if (remoteIp && remoteIp !== "127.0.0.1" && remoteIp !== "localhost") {
+    targetPhoneConfig.host = remoteIp;
+    targetPhoneConfig.autoReconnect = true;
+    targetPhoneConfig.attempt = 0;
+  }
   broadcastJson({ type: "status", meta: streamMeta });
 
   socket.on("data", (chunk) => {
@@ -559,11 +604,101 @@ function attachPhoneStreamSocket(socket, modeLabel = "TCP") {
       }
       broadcastJson({ type: "status", meta: streamMeta });
       console.log("[Stream] Phone disconnected.");
+      if (targetPhoneConfig.autoReconnect && targetPhoneConfig.host) {
+        schedulePhoneAutoReconnect("Mất kết nối Wi-Fi đột ngột");
+      }
     }
   });
 
   socket.on("error", (err) => {
     console.warn(`[Stream Socket Error] ${err.message}`);
+  });
+}
+
+// Target Phone Wi-Fi Auto-Reconnect Manager with Exponential Backoff
+let targetPhoneConfig = {
+  host: null,
+  port: STREAM_PORT,
+  autoReconnect: false,
+  attempt: 0,
+  timer: null,
+  isConnecting: false,
+};
+
+function formatNetworkErrorMessage(err, host, port) {
+  const code = (err && err.code) || "";
+  const msg = (err && err.message) || "";
+  if (code === "ECONNREFUSED") {
+    return `Không thể kết nối tới ${host}:${port} (Bị từ chối - ECONNREFUSED). Hãy chắc chắn ứng dụng HyperMirror trên điện thoại đã được mở và đang bật "BẮT ĐẦU CHIẾU MÀN HÌNH"!`;
+  }
+  if (code === "EHOSTUNREACH" || code === "ENETUNREACH") {
+    return `Không tìm thấy thiết bị ở địa chỉ ${host} (${code} - Không cùng dải mạng). Hãy kiểm tra điện thoại và PC có đang kết nối chung một mạng Wi-Fi không!`;
+  }
+  if (code === "ETIMEDOUT" || msg.includes("timeout") || msg.includes("Timeout")) {
+    return `Hết thời gian chờ kết nối tới ${host}:${port} (Timeout). Có thể do Tường lửa (Windows Firewall) chặn hoặc Router Wi-Fi đang bật tính năng "AP/Client Isolation" ngăn các thiết bị liên lạc với nhau!`;
+  }
+  if (code === "EADDRNOTAVAIL" || code === "EINVAL") {
+    return `Địa chỉ IP ${host} không hợp lệ hoặc máy tính không có tuyến kết nối tới mạng này!`;
+  }
+  return `Không thể kết nối tới ${host}:${port}: ${msg}`;
+}
+
+function schedulePhoneAutoReconnect(reason = "") {
+  if (!targetPhoneConfig.host || !targetPhoneConfig.autoReconnect) return;
+  if (activePhoneSocket && !activePhoneSocket.destroyed) return;
+  if (targetPhoneConfig.isConnecting) return;
+  if (targetPhoneConfig.timer) clearTimeout(targetPhoneConfig.timer);
+
+  // Exponential backoff: 1.5s, 3s, 5.5s, 10s, max 15s + random jitter
+  const backoffSec = Math.min(15, Math.pow(1.8, Math.min(targetPhoneConfig.attempt, 5)));
+  const jitterMs = Math.floor(Math.random() * 400);
+  const delayMs = Math.round(backoffSec * 1000 + jitterMs);
+  targetPhoneConfig.attempt++;
+
+  broadcastJson({
+    type: "reconnect_status",
+    reconnecting: true,
+    target: targetPhoneConfig.host,
+    port: targetPhoneConfig.port,
+    attempt: targetPhoneConfig.attempt,
+    delayMs,
+    reason,
+  });
+
+  console.log(`[Auto-Reconnect] Wi-Fi tự động kết nối lại ${targetPhoneConfig.host}:${targetPhoneConfig.port} sau ${(delayMs / 1000).toFixed(1)}s (lần ${targetPhoneConfig.attempt}, lý do: ${reason || "mất kết nối"})...`);
+
+  targetPhoneConfig.timer = setTimeout(async () => {
+    targetPhoneConfig.timer = null;
+    if (activePhoneSocket && !activePhoneSocket.destroyed) return;
+    targetPhoneConfig.isConnecting = true;
+    try {
+      console.log(`[Auto-Reconnect] Đang thử kết nối lại ${targetPhoneConfig.host}:${targetPhoneConfig.port}...`);
+      await connectToPhoneServer(targetPhoneConfig.host, targetPhoneConfig.port, `Wi-Fi Auto-Reconnect -> ${targetPhoneConfig.host}`);
+      stopPhoneAutoReconnect();
+      broadcastJson({
+        type: "reconnect_status",
+        reconnecting: false,
+        connected: true,
+      });
+    } catch (err) {
+      targetPhoneConfig.isConnecting = false;
+      const formattedErr = formatNetworkErrorMessage(err, targetPhoneConfig.host, targetPhoneConfig.port);
+      schedulePhoneAutoReconnect(formattedErr);
+    }
+  }, delayMs);
+}
+
+function stopPhoneAutoReconnect() {
+  if (targetPhoneConfig.timer) {
+    clearTimeout(targetPhoneConfig.timer);
+    targetPhoneConfig.timer = null;
+  }
+  targetPhoneConfig.autoReconnect = false;
+  targetPhoneConfig.attempt = 0;
+  targetPhoneConfig.isConnecting = false;
+  broadcastJson({
+    type: "reconnect_status",
+    reconnecting: false,
   });
 }
 
@@ -643,10 +778,25 @@ udpBeacon.on("message", (msg, rinfo) => {
   const str = msg.toString("utf8").trim();
   if (str.startsWith("GMIR_PHONE_READY")) {
     const parts = str.split(":");
-    const phonePort = parts.length > 1 ? Number(parts[1]) : 27184;
+    const phonePort = parts.length > 1 && Number(parts[1]) > 0 ? Number(parts[1]) : 27184;
+    const phoneDeviceName = parts.length > 2 ? parts.slice(2).join(":") : "Android Phone";
+    console.log(`[Auto-Discovery] Phone beacon detected from ${rinfo.address}:${phonePort} (${phoneDeviceName})`);
+
+    // Broadcast discovered phone to UI
+    broadcastJson({
+      type: "phone_discovered",
+      host: rinfo.address,
+      port: phonePort,
+      deviceName: phoneDeviceName,
+    });
+
     if (!activePhoneSocket || activePhoneSocket.destroyed) {
-      console.log(`[Auto-Discovery] Phone beacon detected from ${rinfo.address}:${phonePort}, initiating outbound connect...`);
-      connectToPhoneServer(rinfo.address, phonePort, "Wi-Fi Outbound (Firewall Bypass)").catch(() => {});
+      targetPhoneConfig.host = rinfo.address;
+      targetPhoneConfig.port = phonePort;
+      // Reconnect immediately without waiting for backoff
+      connectToPhoneServer(rinfo.address, phonePort, `Wi-Fi Outbound (${phoneDeviceName})`)
+        .then(() => stopPhoneAutoReconnect())
+        .catch(() => {});
     }
   }
 });
@@ -660,15 +810,16 @@ udpBeacon.bind(27185, "0.0.0.0", () => {
 let adbCheckInProgress = false;
 
 setInterval(() => {
-  // Broadcast PC presence on Wi-Fi LAN so Android phones auto-fill the PC IP
+  // Broadcast PC presence across all local LAN subnets
   const msg = Buffer.from(`GMIR_PC_HERE:${STREAM_PORT}`);
   try {
     udpBeacon.send(msg, 27185, "255.255.255.255");
-    for (const item of getLocalLanIps()) {
-      const parts = item.address.split(".");
-      if (parts.length === 4) {
-        parts[3] = "255";
-        udpBeacon.send(msg, 27185, parts.join("."));
+    const lans = getLocalLanIps();
+    const sentBroadcasts = new Set(["255.255.255.255"]);
+    for (const item of lans) {
+      if (item.broadcast && !sentBroadcasts.has(item.broadcast)) {
+        sentBroadcasts.add(item.broadcast);
+        udpBeacon.send(msg, 27185, item.broadcast);
       }
     }
   } catch (_) {}
@@ -748,7 +899,7 @@ function toggleNativeFfplayWindow() {
   }
 }
 
-// 5. Built-in 60FPS Simulator
+// 5. Built-in 60FPS / 120FPS / 144FPS Gaming Simulator
 function toggleBuiltInSimulator(fps = 60, bitrateMbps = 12) {
   if (simulatorProcess) {
     try {
@@ -769,6 +920,7 @@ function toggleBuiltInSimulator(fps = 60, bitrateMbps = 12) {
     return { active: false, error: "Cần cài FFmpeg để chạy bộ giả lập luồng." };
   }
 
+  const validFps = [60, 120, 144].includes(Number(fps)) ? Number(fps) : 60;
   const width = 1280;
   const height = 720;
   const sock = net.createConnection({ host: "127.0.0.1", port: STREAM_PORT }, () => {
@@ -780,22 +932,23 @@ function toggleBuiltInSimulator(fps = 60, bitrateMbps = 12) {
     hs.writeUInt8(1, 5);
     hs.writeUInt16BE(width, 6);
     hs.writeUInt16BE(height, 8);
-    hs.writeUInt16BE(fps, 10);
+    hs.writeUInt16BE(validFps, 10);
     hs.writeUInt32BE(bitrateMbps * 1000, 12);
-    hs.write("SIM-60Hz".padEnd(8, " ").slice(0, 8), 16, "ascii");
+    hs.write(`SIM-${validFps}H`.padEnd(8, " ").slice(0, 8), 16, "ascii");
     sock.write(hs);
 
     const ffArgs = [
       "-re",
       "-f", "lavfi",
-      "-i", `testsrc2=size=${width}x${height}:rate=${fps}`,
+      "-i", `testsrc2=size=${width}x${height}:rate=${validFps}`,
       "-c:v", "libx264",
       "-preset", "ultrafast",
       "-tune", "zerolatency",
-      "-profile:v", "baseline",
+      "-profile:v", "high",
+      "-level:v", "5.2",
       "-pix_fmt", "yuv420p",
       "-b:v", `${bitrateMbps}M`,
-      "-g", String(fps),
+      "-g", String(validFps),
       "-bf", "0",
       "-f", "h264",
       "pipe:1",
@@ -814,7 +967,7 @@ function toggleBuiltInSimulator(fps = 60, bitrateMbps = 12) {
       proc.stdout.on("error", () => {});
       proc.stdout.on("data", (nalChunk) => {
         if (sock.destroyed) return;
-        const ptsUs = (frameIndex * 1000000n) / BigInt(fps);
+        const ptsUs = (frameIndex * 1000000n) / BigInt(validFps);
         frameIndex++;
 
         let fType = FRAME_TYPE_NORMAL;
@@ -905,6 +1058,12 @@ const httpServer = http.createServer(async (req, res) => {
         ffplayActive: Boolean(ffplayProcess),
         simulatorActive: Boolean(simulatorProcess),
         logFile: latestLogPath,
+        reconnectStatus: {
+          reconnecting: Boolean(targetPhoneConfig.timer || targetPhoneConfig.isConnecting),
+          target: targetPhoneConfig.host,
+          port: targetPhoneConfig.port,
+          attempt: targetPhoneConfig.attempt,
+        },
       })
     );
     return;
@@ -1035,6 +1194,13 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === "/api/cancel-reconnect" && req.method === "POST") {
+    stopPhoneAutoReconnect();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, message: "Đã dừng tự động kết nối lại." }));
+    return;
+  }
+
   if (url.pathname === "/api/connect-phone" && req.method === "POST") {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -1051,28 +1217,47 @@ const httpServer = http.createServer(async (req, res) => {
           return;
         }
         const { host, port } = JSON.parse(body || "{}");
-        const targetHost = host || "127.0.0.1";
+        const targetHost = (host || "127.0.0.1").trim();
         const portsToTry = port ? [Number(port)] : [27184, 27183];
         let connected = false;
         let lastErr = null;
+        let successfulPort = portsToTry[0];
+
+        stopPhoneAutoReconnect();
+
         for (const p of portsToTry) {
           try {
             await connectToPhoneServer(targetHost, p, `Direct -> ${targetHost}:${p}`);
             connected = true;
+            successfulPort = p;
             break;
           } catch (e) {
             lastErr = e;
           }
         }
         if (connected) {
+          targetPhoneConfig.host = targetHost;
+          targetPhoneConfig.port = successfulPort;
+          targetPhoneConfig.autoReconnect = true;
+          targetPhoneConfig.attempt = 0;
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true, message: `Đã kết nối thành công tới ${targetHost}!` }));
+          res.end(JSON.stringify({ ok: true, message: `Đã kết nối thành công tới ${targetHost}:${successfulPort}!` }));
         } else {
-          throw lastErr || new Error("Connection failed");
+          // Trigger auto-reconnect backoff if user specified an IP
+          if (targetHost !== "127.0.0.1" && targetHost !== "localhost") {
+            targetPhoneConfig.host = targetHost;
+            targetPhoneConfig.port = portsToTry[0];
+            targetPhoneConfig.autoReconnect = true;
+            targetPhoneConfig.attempt = 1;
+            schedulePhoneAutoReconnect("Kết nối lần đầu không thành công");
+          }
+          const formattedMessage = formatNetworkErrorMessage(lastErr || new Error("Kết nối thất bại"), targetHost, portsToTry[0]);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, message: formattedMessage }));
         }
       } catch (err) {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, message: `Đang chờ điện thoại phát luồng (${err.message})` }));
+        res.end(JSON.stringify({ ok: false, message: `Lỗi kết nối: ${err.message}` }));
       }
     });
     return;
